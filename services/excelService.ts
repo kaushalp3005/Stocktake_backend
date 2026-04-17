@@ -51,7 +51,8 @@ export async function generateAuditExcel(options: ExportOptions): Promise<string
 
   const dataMap = new Map<
     string,
-    Map<string, { calculated: number; measured: number }>
+    Map<string, { calculated: number; measured: number }
+    >
   >();
 
   // Get all floors for the warehouse

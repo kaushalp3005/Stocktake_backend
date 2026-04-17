@@ -272,20 +272,29 @@ model ExportFile {
 // StockTake Entry - Stores individual item entries submitted by floor users
 model StockTakeEntry {
   id               Int      @id @default(autoincrement())
-  itemName         String   @db.VarChar(255)
-  itemType         String   @db.VarChar(10) // 'PM', 'RM', 'FG'
-  itemCategory     String   @db.VarChar(255) // Group
-  itemSubcategory  String   @db.VarChar(255) // Sub-group
-  floorName        String   @db.VarChar(255)
+  entryId          String?  @map("entry_id") @db.VarChar(8) // Batch entry ID format: YYMM0001
+  itemName         String   @map("item_name") @db.VarChar(255)
+  itemType         String   @map("item_type") @db.VarChar(10) // 'PM', 'RM', 'FG'
+  itemCategory     String   @map("item_category") @db.VarChar(255) // Group
+  itemSubcategory  String   @map("item_subcategory") @db.VarChar(255) // Sub-group
+  floorName        String   @map("floor_name") @db.VarChar(255)
   warehouse        String   @db.VarChar(255)
-  totalQuantity    Int // Number of units
-  unitUom          Decimal  @db.Decimal(10, 3) // UOM (weight per unit in kg)
-  totalWeight      Decimal  @db.Decimal(10, 2) // Calculated: totalQuantity * unitUom
-  enteredBy        String   @db.VarChar(255) // Username
-  enteredByEmail   String?  @db.VarChar(255) // User email
+  totalQuantity    Int      @map("total_quantity") // Number of units
+  unitUom          Decimal  @map("unit_uom") @db.Decimal(10, 3) // UOM (weight per unit in kg)
+  totalWeight      Decimal  @map("total_weight") @db.Decimal(10, 2) // Calculated: totalQuantity * unitUom
+  enteredBy        String   @map("entered_by") @db.VarChar(255) // Username
+  enteredByEmail   String?  @map("entered_by_email") @db.VarChar(255) // User email
   authority        String   @db.VarChar(255)
-  createdAt        DateTime @default(now()) @db.Timestamp
-  updatedAt        DateTime @updatedAt @db.Timestamp
+  stockType        String?  @map("stock_type") @default("Fresh Stock") @db.VarChar(50) // 'Fresh Stock' or 'Off Grade/Rejection'
+  status           String   @default("submitted") @db.VarChar(20) // 'draft' or 'submitted'
+  isChecked        Boolean  @default(false) @map("is_checked") // Floor review check
+  verified         Boolean? @default(false) // Verification status
+  verifiedBy       String?  @map("verified_by") @db.VarChar(255) // Username who verified
+  verifiedAt       DateTime? @map("verified_at") @db.Timestamp // When verified
+  remark           String?  @db.VarChar(255) // Verification remark (max 120 chars)
+  edits            Json?    // Array<EntryEdit> — append-only edit history
+  createdAt        DateTime @map("created_at") @default(now()) @db.Timestamp
+  updatedAt        DateTime @map("updated_at") @updatedAt @db.Timestamp
 
   @@index([itemName])
   @@index([warehouse])
@@ -293,6 +302,11 @@ model StockTakeEntry {
   @@index([enteredBy])
   @@index([createdAt])
   @@index([itemType])
+  @@index([stockType])
   @@index([warehouse, floorName])
+  @@index([entryId])
+  @@index([status])
+  @@index([enteredByEmail, status])
+  @@index([verified])
   @@map("stocktake_entries")
 }

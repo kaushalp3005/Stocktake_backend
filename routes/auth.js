@@ -1,0 +1,216 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.me = exports.register = exports.login = void 0;
+const auth_js_1 = require("../utils/auth.js");
+const client_1 = require("@prisma/client");
+const prisma = new client_1.PrismaClient();
+// Map database roles to application roles
+function mapRoleToAppRole(dbRole) {
+    const roleUpper = dbRole.toUpperCase();
+    if (roleUpper === "FLOORHEAD" || roleUpper === "FLOOR_HEAD") {
+        return "FLOOR_MANAGER";
+    }
+    if (roleUpper === "MANAGER" || roleUpper === "INVENTORY_MANAGER") {
+        return "INVENTORY_MANAGER";
+    }
+    if (roleUpper === "SUPERUSER" || roleUpper === "SUPER_USER") {
+        return "SUPERUSER";
+    }
+    if (roleUpper === "ADMIN") {
+        return "ADMIN";
+    }
+    // Default to FLOOR_MANAGER for unknown roles
+    return "FLOOR_MANAGER";
+}
+const login = async (req, res) => {
+    console.log("Login request received:", {
+        body: req.body,
+        hasUsername: !!req.body?.username,
+        hasPassword: !!req.body?.password
+    });
+    try {
+        const { username, password } = req.body;
+        if (!username || !password) {
+            return res
+                .status(400)
+                .json({ error: "Username and password are required" });
+        }
+        // Find user in stocktake_users table
+        let users = [];
+        try {
+            const query = client_1.Prisma.sql `
+      SELECT id, username, password, warehouse, role, name, email, is_active
+      FROM stocktake_users
+      WHERE username = ${username}
+      LIMIT 1
+    `;
+            console.log("Executing database query for username:", username);
+            users = await prisma.$queryRaw(query);
+            console.log("Database query result:", {
+                userCount: users.length,
+                foundUser: users.length > 0 ? {
+                    id: users[0]?.id,
+                    username: users[0]?.username,
+                    hasPassword: !!users[0]?.password,
+                    is_active: users[0]?.is_active,
+                    role: users[0]?.role
+                } : null
+            });
+        }
+        catch (dbError) {
+            console.error("Database query error:", dbError);
+            // Check if table doesn't exist
+            if (dbError.message?.includes("does not exist") || dbError.message?.includes("relation")) {
+                return res.status(500).json({
+                    error: "Database table not found",
+                    message: "The stocktake_users table does not exist. Please run database migrations."
+                });
+            }
+            // Check if connection error
+            if (dbError.message?.includes("connect") || dbError.message?.includes("timeout")) {
+                return res.status(500).json({
+                    error: "Database connection failed",
+                    message: "Unable to connect to the database. Please check your DATABASE_URL."
+                });
+            }
+            throw dbError; // Re-throw if it's a different error
+        }
+        if (users.length === 0) {
+            console.log("User not found in database for username:", username);
+            return res.status(401).json({ error: "Invalid credentials" });
+        }
+        const dbUser = users[0];
+        // Check if user is active
+        if (!dbUser.is_active) {
+            console.log("User account is disabled:", username);
+            return res.status(403).json({ error: "Account is disabled" });
+        }
+        // Check password (plain text comparison for now - should be hashed in production)
+        console.log("Comparing passwords:", {
+            providedPassword: password,
+            dbPassword: dbUser.password,
+            match: dbUser.password === password
+        });
+        if (dbUser.password !== password) {
+            console.log("Password mismatch for user:", username);
+            return res.status(401).json({ error: "Invalid credentials" });
+        }
+        // Map database role to application role
+        const appRole = mapRoleToAppRole(dbUser.role || "");
+        const token = (0, auth_js_1.generateToken)({
+            userId: dbUser.id.toString(),
+            email: dbUser.email || dbUser.username,
+            role: appRole,
+        });
+        res.json({
+            token,
+            user: {
+                id: dbUser.id.toString(),
+                username: dbUser.username,
+                email: dbUser.email || dbUser.username,
+                name: dbUser.name || dbUser.username,
+                role: appRole,
+                warehouse: dbUser.warehouse,
+                dbRole: dbUser.role, // Keep original role from DB
+            },
+        });
+    }
+    catch (error) {
+        console.error("Login error:", error);
+        // Ensure we always send JSON response
+        if (!res.headersSent) {
+            res.status(500).json({
+                error: "Internal server error",
+                message: error?.message || "An unexpected error occurred",
+                details: process.env.NODE_ENV === "development" ? error?.stack : undefined
+            });
+        }
+    }
+};
+exports.login = login;
+const register = async (req, res) => {
+    try {
+        const { email, password, name, role = "FLOOR_MANAGER" } = req.body;
+        if (!email || !password || !name) {
+            return res
+                .status(400)
+                .json({ error: "Email, password, and name are required" });
+        }
+        // Check if user already exists in database
+        const existingQuery = client_1.Prisma.sql `
+      SELECT id, email, username
+      FROM stocktake_users
+      WHERE email = ${email} OR username = ${email}
+      LIMIT 1
+    `;
+        const existingUsers = await prisma.$queryRaw(existingQuery);
+        if (existingUsers.length > 0) {
+            return res.status(400).json({ error: "Email or username already in use" });
+        }
+        // Create new user in database
+        const insertQuery = client_1.Prisma.sql `
+      INSERT INTO stocktake_users (username, email, password, name, role, is_active, created_at)
+      VALUES (${email}, ${email}, ${password}, ${name}, ${role}, true, NOW())
+      RETURNING id, username, email, name, role
+    `;
+        const newUsers = await prisma.$queryRaw(insertQuery);
+        if (newUsers.length === 0) {
+            return res.status(500).json({ error: "Failed to create user" });
+        }
+        const newUser = newUsers[0];
+        const appRole = mapRoleToAppRole(newUser.role || role);
+        const token = (0, auth_js_1.generateToken)({
+            userId: newUser.id.toString(),
+            email: newUser.email || newUser.username,
+            role: appRole,
+        });
+        res.status(201).json({
+            token,
+            user: {
+                id: newUser.id.toString(),
+                email: newUser.email || newUser.username,
+                name: newUser.name,
+                role: appRole,
+            },
+        });
+    }
+    catch (error) {
+        console.error("Register error:", error);
+        res.status(500).json({ error: "Internal server error" });
+    }
+};
+exports.register = register;
+const me = async (req, res) => {
+    try {
+        if (!req.user) {
+            return res.status(401).json({ error: "Unauthorized" });
+        }
+        // Find user in stocktake_users table by ID
+        const query = client_1.Prisma.sql `
+      SELECT id, username, warehouse, role, name, email, is_active
+      FROM stocktake_users
+      WHERE id = ${parseInt(req.user.userId)} OR id::text = ${req.user.userId}
+      LIMIT 1
+    `;
+        const users = await prisma.$queryRaw(query);
+        if (users.length === 0) {
+            return res.status(404).json({ error: "User not found" });
+        }
+        const dbUser = users[0];
+        const appRole = mapRoleToAppRole(dbUser.role || "");
+        res.json({
+            id: dbUser.id.toString(),
+            username: dbUser.username,
+            email: dbUser.email || dbUser.username,
+            name: dbUser.name || dbUser.username,
+            role: appRole,
+            warehouse: dbUser.warehouse,
+            dbRole: dbUser.role,
+        });
+    }
+    catch (error) {
+        console.error("Me error:", error);
+        res.status(500).json({ error: "Internal server error" });
+    }
+};
+exports.me = me;

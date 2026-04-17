@@ -53,18 +53,31 @@ import {
   submitStocktakeEntries,
   getStocktakeEntries,
   getGroupedStocktakeEntries,
+  getAvailableEntryDates,
   updateStocktakeEntry,
   deleteStocktakeEntry,
   getAuditSessionStatus,
   saveStocktakeResultsheet,
   clearAllEntries,
+  clearWarehouseEntries,
+  clearFloorEntries,
   getResultsheetList,
   getResultsheetData,
+  getResultsheetMultiDate,
   deleteResultsheet,
   searchItemDescriptions,
+  saveFloorReviewRecords,
+  getFloorReviewRecords,
+  addDraftEntry,
+  getDraftEntries,
+  finalizeDraftEntries,
+  deleteStocktakeEntriesBySession,
 } from "./routes/items.js";
-import { generateExport, getExports } from "./routes/exports.js";
+import { getUserFloors, getAllFloors } from "./routes/floors.js";
+import { generateExport, getExports, exportStocktakeEntries } from "./routes/exports.js";
 import { getManagerUsers } from "./routes/users.js";
+import { upload, uploadSkuFile, getSkuUploadStatus } from "./routes/sku.js";
+import { lookupBox } from "./routes/boxes.js";
 
 export function createServer() {
   const app = express();
@@ -80,20 +93,59 @@ export function createServer() {
     });
   }
 
-  // Middleware
-  app.use(cors());
-  app.use(express.json());
-  app.use(express.urlencoded({ extended: true }));
+  // CORS middleware - MUST be first and handle ALL requests including OPTIONS
+  // This is critical for AWS Lambda + API Gateway
+  app.use((req, res, next) => {
+    // Set CORS headers on EVERY response
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, X-Api-Key, X-Amz-Date, X-Amz-Security-Token');
+    res.setHeader('Access-Control-Max-Age', '86400');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+
+    // Handle OPTIONS preflight requests IMMEDIATELY - don't let them go further
+    if (req.method === 'OPTIONS') {
+      console.log(`✅ CORS preflight handled for: ${req.path}`);
+      res.status(200).end();
+      return;
+    }
+
+    next();
+  });
+
+  // Simple CORS - allow all origins for Lambda compatibility
+  app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin', 'X-Api-Key', 'X-Amz-Date', 'X-Amz-Security-Token'],
+    credentials: false, // Must be false when origin is *
+    optionsSuccessStatus: 200
+  }));
+
+  app.use(express.json({ limit: "50mb" }));
+  app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
   // Health check
   app.get("/api/ping", (_req, res) => {
     res.json({ message: "pong" });
   });
 
+  // CORS test endpoint
+  app.get("/api/cors-test", (_req, res) => {
+    res.json({
+      message: "CORS test successful",
+      timestamp: new Date().toISOString()
+    });
+  });
+
   // ============ Auth Routes (public) ============
   app.post("/api/auth/login", login);
   app.post("/api/auth/register", register);
   app.get("/api/auth/me", authMiddleware, me);
+
+  // ============ Floor Routes ============
+  app.get("/api/floors", authMiddleware, getUserFloors);
+  app.get("/api/floors/all", authMiddleware, requireRole("INVENTORY_MANAGER", "SUPERUSER", "ADMIN"), getAllFloors);
 
   // ============ Warehouse Routes ============
   app.get("/api/warehouses", authMiddleware, getUserWarehouses);
@@ -220,16 +272,39 @@ export function createServer() {
     blockFloorManagerWritesDuringAudit,
     submitStocktakeEntries
   );
+  // Draft entry endpoints (must come before parameterized :entryId routes)
+  app.post(
+    "/api/stocktake-entries/draft",
+    authMiddleware,
+    blockFloorManagerWritesDuringAudit,
+    addDraftEntry
+  );
+  app.get("/api/stocktake-entries/drafts", authMiddleware, getDraftEntries);
+  app.post(
+    "/api/stocktake-entries/finalize-drafts",
+    authMiddleware,
+    blockFloorManagerWritesDuringAudit,
+    finalizeDraftEntries
+  );
+  app.delete(
+    "/api/stocktake-entries/delete-session",
+    authMiddleware,
+    blockFloorManagerWritesDuringAudit,
+    deleteStocktakeEntriesBySession
+  );
   app.get("/api/stocktake-entries", authMiddleware, getStocktakeEntries);
+  app.get("/api/stocktake-entries/available-dates", authMiddleware, getAvailableEntryDates);
   app.get("/api/stocktake-entries/grouped", authMiddleware, getGroupedStocktakeEntries);
-  app.get("/api/stocktake-entries/audit-status", authMiddleware, getAuditSessionStatus);
+  app.get("/api/stocktake-entries/audit-status", authMiddleware, requireRole("INVENTORY_MANAGER", "SUPERUSER", "ADMIN"), getAuditSessionStatus);
   app.post(
     "/api/stocktake-entries/save-resultsheet",
     authMiddleware,
-    requireRole("INVENTORY_MANAGER", "ADMIN"),
+    requireRole("INVENTORY_MANAGER", "SUPERUSER", "ADMIN"),
     saveStocktakeResultsheet
   );
-  app.delete("/api/stocktake-entries/clear-all", authMiddleware, requireRole("INVENTORY_MANAGER", "ADMIN"), clearAllEntries);
+  app.delete("/api/stocktake-entries/clear-all", authMiddleware, requireRole("INVENTORY_MANAGER", "SUPERUSER", "ADMIN"), clearAllEntries);
+  app.delete("/api/stocktake-entries/warehouse/:warehouse", authMiddleware, requireRole("INVENTORY_MANAGER", "SUPERUSER", "ADMIN"), clearWarehouseEntries);
+  app.delete("/api/stocktake-entries/warehouse/:warehouse/floor/:floor", authMiddleware, requireRole("INVENTORY_MANAGER", "SUPERUSER", "ADMIN"), clearFloorEntries);
   // Note: Specific routes (like clear-all) must come before parameterized routes (like :entryId)
   app.put(
     "/api/stocktake-entries/:entryId",
@@ -246,24 +321,51 @@ export function createServer() {
   
   // ============ Stocktake Resultsheet Routes ============
   app.get("/api/stocktake-resultsheet/list", authMiddleware, getResultsheetList);
+  app.get("/api/stocktake-resultsheet/merged", authMiddleware, getResultsheetMultiDate);
   app.get("/api/stocktake-resultsheet/:date", authMiddleware, getResultsheetData);
-  app.delete("/api/stocktake-resultsheet/:date", authMiddleware, requireRole("INVENTORY_MANAGER", "ADMIN"), deleteResultsheet);
+  app.delete("/api/stocktake-resultsheet/:date", authMiddleware, requireRole("INVENTORY_MANAGER", "SUPERUSER", "ADMIN"), deleteResultsheet);
+
+  // ============ Floor Review Records Routes ============
+  app.post("/api/floor-review-records", authMiddleware, requireRole("INVENTORY_MANAGER", "SUPERUSER", "ADMIN"), saveFloorReviewRecords);
+  app.get("/api/floor-review-records", authMiddleware, getFloorReviewRecords);
 
   // ============ Users Routes ============
   app.get("/api/users/managers", authMiddleware, getManagerUsers);
+
+  // Box QR-code lookup (CDPL / CFPL boxes → article details for StockTake)
+  app.get("/api/boxes/lookup", authMiddleware, lookupBox);
 
   // ============ Export Routes ============
   app.post(
     "/api/export/generate",
     authMiddleware,
-    requireRole("INVENTORY_MANAGER", "ADMIN"),
+    requireRole("INVENTORY_MANAGER", "SUPERUSER", "ADMIN"),
     generateExport
+  );
+  app.post(
+    "/api/export/stocktake-entries",
+    authMiddleware,
+    exportStocktakeEntries
   );
   app.get(
     "/api/exports",
     authMiddleware,
     requireRole("ADMIN"),
     getExports
+  );
+
+  // ============ SKU Upload Routes ============
+  app.post(
+    "/api/sku/upload",
+    authMiddleware,
+    requireRole("INVENTORY_MANAGER", "ADMIN", "SUPERUSER"),
+    upload.single("skuFile"),
+    uploadSkuFile
+  );
+  app.get(
+    "/api/sku/status",
+    authMiddleware,
+    getSkuUploadStatus
   );
 
   // 404 handler for unmatched API routes (must be after all route definitions)
@@ -289,3 +391,8 @@ export function createServer() {
 
   return app;
 }
+
+// For Lambda deployment
+const serverless = require("serverless-http");
+const app = createServer();
+export const handler = serverless(app);

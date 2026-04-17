@@ -46,16 +46,22 @@ export async function blockFloorManagerWritesDuringAudit(
 
     // If we have warehouse name, look up the warehouse ID
     if (warehouseName && !warehouseId) {
-      const warehouse = await prisma.warehouse.findFirst({
-        where: {
-          name: {
-            equals: warehouseName,
-            mode: "insensitive",
+      try {
+        const warehouse = await prisma.warehouse.findFirst({
+          where: {
+            name: {
+              equals: warehouseName,
+              mode: "insensitive",
+            },
           },
-        },
-        select: { id: true },
-      });
-      if (warehouse) warehouseId = warehouse.id;
+          select: { id: true },
+        });
+        if (warehouse) warehouseId = warehouse.id;
+      } catch (error: any) {
+        // Handle case where warehouse table doesn't exist
+        console.warn("Warehouse table not found, skipping warehouse lookup:", error.message);
+        // Continue without warehouse ID - this allows the operation to proceed
+      }
     }
 
     // If we still don't have warehouseId, try to get it from session/pallet/entry

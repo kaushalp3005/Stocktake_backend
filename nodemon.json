@@ -2,7 +2,7 @@
   "watch": ["."],
   "ext": "ts,js,json",
   "ignore": ["node_modules", "dist", "*.test.ts", "*.spec.ts"],
-  "exec": "tsx node-build.ts",
+  "exec": "npx tsx node-build.ts",
   "env": {
     "PORT": "8000",
     "NODE_ENV": "development"

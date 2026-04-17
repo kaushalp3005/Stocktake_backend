@@ -203,6 +203,7 @@ export const createSubCategory: RequestHandler<
 };
 
 // Get categorial inventory data based on item type (PM/RM/FG)
+// Uses all_sku table with columns: item_type, item_group, sub_group, particulars, uom
 export const getCategorialInventory: RequestHandler<{ itemType: string }> = async (
   req,
   res
@@ -214,66 +215,28 @@ export const getCategorialInventory: RequestHandler<{ itemType: string }> = asyn
       return res.status(400).json({ error: "Invalid item type. Must be PM, RM, or FG" });
     }
 
-    // The item type (pm, rm, fg) is a VALUE in a column, not a column name itself
-    // Search for the selected item type value in the fg/rm/pm column
-    // Then return distinct group (category), sub_group (subcategory), and particulars (description)
-    // Note: "group" is a reserved word in SQL, so it must be quoted
-    const itemTypeValue = itemType.toLowerCase(); // pm, rm, or fg (as a value to search for)
-    
-    // Try different possible column names for the item type column
-    // The column might be named: "fg/rm/pm", "item_type", "type", etc.
-    // Also fetch UOM column which contains weight in kg
-    let data;
-    const queries = [
-      // Try column name "fg/rm/pm" (with quotes for special characters) and include UOM
-      // Try both quoted and unquoted UOM column (PostgreSQL might return either)
-      `SELECT DISTINCT "group", "sub_group", "particulars", "uom" FROM categorial_inv WHERE "fg/rm/pm" = '${itemTypeValue}' AND "group" IS NOT NULL AND TRIM(CAST("group" AS VARCHAR)) != '' ORDER BY "group", "sub_group", "particulars"`,
-      // Try with unquoted UOM column
-      `SELECT DISTINCT "group", "sub_group", "particulars", uom FROM categorial_inv WHERE "fg/rm/pm" = '${itemTypeValue}' AND "group" IS NOT NULL AND TRIM(CAST("group" AS VARCHAR)) != '' ORDER BY "group", "sub_group", "particulars"`,
-      // Try unquoted item_type column (PostgreSQL will lowercase) and include UOM
-      `SELECT DISTINCT "group", "sub_group", "particulars", uom FROM categorial_inv WHERE item_type = '${itemTypeValue}' AND "group" IS NOT NULL AND TRIM(CAST("group" AS VARCHAR)) != '' ORDER BY "group", "sub_group", "particulars"`,
-      // Try "type" column and include UOM
-      `SELECT DISTINCT "group", "sub_group", "particulars", uom FROM categorial_inv WHERE type = '${itemTypeValue}' AND "group" IS NOT NULL AND TRIM(CAST("group" AS VARCHAR)) != '' ORDER BY "group", "sub_group", "particulars"`,
-      // Try "fg_rm_pm" (underscore version) and include UOM
-      `SELECT DISTINCT "group", "sub_group", "particulars", uom FROM categorial_inv WHERE fg_rm_pm = '${itemTypeValue}' AND "group" IS NOT NULL AND TRIM(CAST("group" AS VARCHAR)) != '' ORDER BY "group", "sub_group", "particulars"`,
-      // Try "category_type" and include UOM
-      `SELECT DISTINCT "group", "sub_group", "particulars", uom FROM categorial_inv WHERE category_type = '${itemTypeValue}' AND "group" IS NOT NULL AND TRIM(CAST("group" AS VARCHAR)) != '' ORDER BY "group", "sub_group", "particulars"`
-    ];
+    const itemTypeValue = itemType.toLowerCase();
 
-    let lastError: any = null;
-    for (let i = 0; i < queries.length; i++) {
-      try {
-        data = await prisma.$queryRawUnsafe(queries[i]);
-        console.log(`Successfully queried using query attempt ${i + 1}`);
-        break;
-      } catch (error: any) {
-        console.error(`Query error with attempt ${i + 1}:`, error.message);
-        lastError = error;
-        if (i === queries.length - 1) {
-          // Last attempt failed
-          return res.json({
-            itemType: itemType.toUpperCase(),
-            groups: [],
-            error: `Unable to query categorial_inv table. Tried different column names for item type. Please verify the column name that stores PM/RM/FG values. Last error: ${lastError?.message}. Column name should be one of: "fg/rm/pm", fg_rm_pm, item_type, or type`,
-          });
-        }
-        continue;
-      }
-    }
+    const data: any[] = await prisma.$queryRawUnsafe(
+      `SELECT DISTINCT item_group, sub_group, particulars, uom
+       FROM all_sku
+       WHERE LOWER(item_type) = $1
+         AND item_group IS NOT NULL
+         AND TRIM(CAST(item_group AS VARCHAR)) != ''
+       ORDER BY item_group, sub_group, particulars`,
+      itemTypeValue
+    );
 
-    // Group the data by group -> subgroup -> particulars with UOM
+    // Group the data by item_group -> sub_group -> particulars with UOM
     const groupedData: Record<string, Record<string, Array<{ name: string; uom: number | null }>>> = {};
-    
-    (data as any[]).forEach((row: any) => {
-      // Handle different possible column name variations
-      // PostgreSQL returns column names based on how they were selected (quoted or unquoted)
-      const group = (row.group || row.Group || row["group"] || "").toString().trim().toUpperCase();
-      const subgroup = (row.sub_group || row.subgroup || row.SubGroup || row.Subgroup || row["sub_group"] || "").toString().trim().toUpperCase();
-      const particulars = (row.particulars || row.Particulars || row["particulars"] || "").toString().trim().toUpperCase();
-      // Handle UOM column - try different case variations and handle null/empty values
-      const uom = row.uom || row.UOM || row.Uom || row["uom"] || null;
+
+    data.forEach((row: any) => {
+      const group = (row.item_group || "").toString().trim().toUpperCase();
+      const subgroup = (row.sub_group || "").toString().trim().toUpperCase();
+      const particulars = (row.particulars || "").toString().trim().toUpperCase();
+      const uom = row.uom;
       let uomValue: number | null = null;
-      
+
       if (uom !== null && uom !== undefined && uom !== '') {
         const parsedUom = parseFloat(uom.toString());
         if (!isNaN(parsedUom)) {
@@ -281,7 +244,7 @@ export const getCategorialInventory: RequestHandler<{ itemType: string }> = asyn
         }
       }
 
-      if (!group) return; // Skip rows without group
+      if (!group) return;
 
       if (!groupedData[group]) {
         groupedData[group] = {};
@@ -291,15 +254,11 @@ export const getCategorialInventory: RequestHandler<{ itemType: string }> = asyn
           groupedData[group][subgroup] = [];
         }
         if (particulars) {
-          // Check if this particulars already exists
           const existingIndex = groupedData[group][subgroup].findIndex(p => p.name === particulars);
           if (existingIndex === -1) {
             groupedData[group][subgroup].push({ name: particulars, uom: uomValue });
-          } else {
-            // If UOM is missing from existing entry but we have it now, update it
-            if (groupedData[group][subgroup][existingIndex].uom === null && uomValue !== null) {
-              groupedData[group][subgroup][existingIndex].uom = uomValue;
-            }
+          } else if (groupedData[group][subgroup][existingIndex].uom === null && uomValue !== null) {
+            groupedData[group][subgroup][existingIndex].uom = uomValue;
           }
         }
       }
@@ -317,9 +276,9 @@ export const getCategorialInventory: RequestHandler<{ itemType: string }> = asyn
     });
   } catch (error: any) {
     console.error("Get categorial inventory error:", error);
-    res.status(500).json({ 
+    res.status(500).json({
       error: "Internal server error",
-      details: error.message 
+      details: error.message
     });
   }
 };
@@ -340,77 +299,135 @@ export const submitStocktakeEntries: RequestHandler = async (req, res) => {
     // Validate each entry
     for (let i = 0; i < entries.length; i++) {
       const entry = entries[i];
-      if (!entry.description && !entry.itemName) {
-        return res.status(400).json({ 
-          error: `Entry ${i + 1}: Missing required field: itemName or description` 
-        });
-      }
-      if (!entry.floorName && !entry.floor) {
-        return res.status(400).json({ 
-          error: `Entry ${i + 1}: Missing required field: floorName or floor` 
-        });
-      }
-      if (!entry.warehouse) {
-        return res.status(400).json({ 
-          error: `Entry ${i + 1}: Missing required field: warehouse` 
-        });
-      }
-      if (!entry.userName && !entry.enteredBy) {
-        return res.status(400).json({ 
-          error: `Entry ${i + 1}: Missing required field: userName or enteredBy` 
-        });
-      }
-      if (!entry.authority) {
-        return res.status(400).json({ 
-          error: `Entry ${i + 1}: Missing required field: authority` 
-        });
-      }
+      // Note: All field validations removed as requested
     }
+
+    // Generate batch entry_id for all items in this submission
+    // Format: YYMM0001 (e.g., 2502 for Feb 2025, then 4-digit sequence)
+    let batchEntryId: string;
+    try {
+      console.log("🔧 Generating entry_id...");
+
+      // Create/update the function to generate entry_id
+      await prisma.$executeRaw`
+        CREATE OR REPLACE FUNCTION generate_batch_entry_id()
+        RETURNS VARCHAR(8) AS $$
+        DECLARE
+            year_month VARCHAR(4);
+            next_sequence INTEGER;
+            new_entry_id VARCHAR(8);
+        BEGIN
+            -- Get current year (last 2 digits) and month
+            year_month := TO_CHAR(CURRENT_DATE, 'YYMM');
+
+            -- Find the highest sequence number for current year-month
+            SELECT COALESCE(
+                MAX(CAST(RIGHT(entry_id, 4) AS INTEGER)),
+                0
+            ) + 1
+            INTO next_sequence
+            FROM stocktake_entries
+            WHERE entry_id LIKE year_month || '%' AND entry_id IS NOT NULL;
+
+            -- Format the new entry_id with leading zeros
+            new_entry_id := year_month || LPAD(next_sequence::TEXT, 4, '0');
+
+            RETURN new_entry_id;
+        END;
+        $$ LANGUAGE plpgsql;
+      `;
+      console.log("✅ Function created/updated");
+
+      // Generate the entry_id
+      const entryIdResult: any[] = await prisma.$queryRaw`SELECT generate_batch_entry_id() as entry_id`;
+      batchEntryId = entryIdResult[0].entry_id;
+      console.log(`✅ Generated batch entry_id: ${batchEntryId} for ${entries.length} items`);
+
+    } catch (error) {
+      console.error("❌ Error generating entry_id:", error);
+      // Manual fallback using timestamp
+      const now = new Date();
+      const year = now.getFullYear().toString().slice(-2);
+      const month = (now.getMonth() + 1).toString().padStart(2, '0');
+      const sequence = Math.floor(Math.random() * 9999) + 1;
+      batchEntryId = year + month + sequence.toString().padStart(4, '0');
+      console.log(`⚠️ Using manual fallback entry_id: ${batchEntryId}`);
+    }
+
+    if (!batchEntryId) {
+      console.error("❌ Failed to generate entry_id, using timestamp fallback");
+      const timestamp = Date.now().toString().slice(-8);
+      batchEntryId = timestamp;
+    }
+
+    console.log(`🎯 Final entry_id to use: ${batchEntryId}`);
 
     // Prepare entries for insertion
     // DO NOT include id in INSERT - let DB auto-generate
-    const insertPromises = entries.map(async (entry: any) => {
+    const insertPromises = entries.map(async (entry: any, idx: number) => {
+      console.log(`🔍 Entry ${idx + 1} received:`, JSON.stringify(entry, null, 2));
 
-      const itemName = (entry.itemName || entry.description || "").toUpperCase();
-      const itemType = (entry.itemType || "").toUpperCase();
-      const itemCategory = (entry.category || entry.itemCategory || "").toUpperCase();
-      const itemSubcategory = (entry.subcategory || entry.itemSubcategory || "").toUpperCase();
-      const floorName = (entry.floorName || entry.floor || "").toUpperCase();
-      const warehouse = (entry.warehouse || "").toUpperCase();
-      const totalQuantity = parseFloat(entry.units || entry.totalQuantity || "0");
-      const unitUom = parseFloat(entry.packageSize || entry.unitUom || 0);
-      const totalWeight = parseFloat(entry.totalWeight || (totalQuantity * unitUom).toFixed(2));
-      const enteredBy = (entry.enteredBy || entry.userName || "").toUpperCase();
-      const enteredByEmail = entry.enteredByEmail || entry.userEmail || null;
-      const authority = (entry.authority || "").toUpperCase();
+      const itemName = (entry.item_name || entry.itemName || entry.description || "UNSPECIFIED").toUpperCase();
+      const itemType = (entry.item_type || entry.itemType || "FG").toUpperCase(); // Default to FG if not specified
+      const itemCategory = (entry.item_category || entry.category || entry.itemCategory || "GENERAL").toUpperCase();
+      const itemSubcategory = (entry.item_subcategory || entry.subcategory || entry.itemSubcategory || "OTHER").toUpperCase();
 
-      // Use Prisma.sql for safe parameterized query
+      const floorName = (entry.floor_name || entry.floorName || entry.floor || "MAIN").toUpperCase();
+      const warehouse = (entry.warehouse || "MAIN").toUpperCase();
+      const totalQuantity = parseFloat(entry.total_quantity || entry.units || entry.totalQuantity || "0") || 0;
+      const unitUom = parseFloat(entry.unit_uom || entry.packageSize || entry.unitUom || 0) || 0;
+      const totalWeight = parseFloat(entry.total_weight || entry.totalWeight || (totalQuantity * unitUom).toFixed(2)) || 0;
+      const enteredBy = (entry.entered_by || entry.enteredBy || entry.userName || "UNKNOWN").toUpperCase();
+      const enteredByEmail = entry.entered_by_email || entry.enteredByEmail || entry.userEmail || null;
+      const authority = (entry.authority || "FLOOR_MANAGER").toUpperCase();
+      const stockType = entry.stock_type || entry.stockType || "Fresh Stock";
+      const verified = entry.verified || false;
+      const verifiedBy = entry.verified_by || entry.verifiedBy || null;
+      const verifiedAt = entry.verified_at || entry.verifiedAt || null;
+      const remark = entry.remark || null;
+      const edits = entry.edits ? JSON.stringify(entry.edits) : null;
+
+      console.log(`✅ Entry ${idx + 1} mapped to:`, {
+        itemName, itemType, itemCategory, itemSubcategory,
+        floorName, warehouse, totalQuantity, unitUom, totalWeight,
+        enteredBy, enteredByEmail, authority, stockType, entryId: batchEntryId
+      });
+
+      // Use Prisma.sql for safe parameterized query with entry_id
       // RETURNING clause to get inserted row with generated ID
       const query = Prisma.sql`
         INSERT INTO stocktake_entries (
           item_name, item_type, item_category, item_subcategory,
           floor_name, warehouse, total_quantity, unit_uom, total_weight,
-          entered_by, entered_by_email, authority, created_at, updated_at
+          entered_by, entered_by_email, authority, stock_type, entry_id,
+          verified, verified_by, verified_at, remark, edits,
+          created_at, updated_at
         ) VALUES (${itemName}, ${itemType}, ${itemCategory}, ${itemSubcategory},
           ${floorName}, ${warehouse}, ${totalQuantity}, ${unitUom}, ${totalWeight},
-          ${enteredBy}, ${enteredByEmail || null}, ${authority}, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-        RETURNING id, item_name, warehouse, floor_name, total_quantity, total_weight
+          ${enteredBy}, ${enteredByEmail}, ${authority}, ${stockType}, ${batchEntryId},
+          ${verified}, ${verifiedBy}, ${verifiedAt ? new Date(verifiedAt) : null}::timestamp, ${remark}, ${edits}::jsonb,
+          CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        RETURNING id, item_name, warehouse, floor_name, total_quantity, total_weight, stock_type, entry_id
       `;
 
       const inserted: any[] = await prisma.$queryRaw(query) as any[];
+      console.log(`✅ Entry ${idx + 1} inserted with entry_id:`, inserted[0]?.entry_id);
       return inserted[0]; // Return inserted row with generated ID
     });
 
     const insertedRows = await Promise.all(insertPromises);
 
+    console.log(`🎉 Successfully inserted ${insertedRows.length} items with entry_id: ${batchEntryId}`);
+
     res.json({
       success: true,
-      message: `Successfully submitted ${entries.length} entries`,
+      message: `Successfully submitted ${entries.length} entries with entry_id: ${batchEntryId}`,
       count: entries.length,
+      entryId: batchEntryId,
       insertedIds: insertedRows.map(r => r.id), // Return generated IDs
     });
   } catch (error: any) {
-    console.error("Submit stocktake entries error:", error);
+    console.error("❌ Submit stocktake entries error:", error);
     res.status(500).json({
       error: "Internal server error",
       details: error.message,
@@ -425,7 +442,14 @@ export const getStocktakeEntries: RequestHandler = async (req, res) => {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    const { warehouse, floorName, itemName, enteredBy, itemType, startDate, endDate } = req.query;
+    const { warehouse, floorName, itemName, enteredBy, itemType, startDate, endDate, limit, includeDrafts } = req.query;
+
+    console.log('🔍 GET /api/stocktake-entries - Query params:', {
+      warehouse, floorName, itemName, enteredBy, itemType, startDate, endDate, limit, includeDrafts
+    });
+
+    // Parse limit parameter (default: no limit, max: 1000)
+    const limitValue = limit ? Math.min(Math.max(1, parseInt(limit as string, 10) || 1000), 1000) : null;
 
     // Build where clause
     const where: any = {};
@@ -469,8 +493,8 @@ export const getStocktakeEntries: RequestHandler = async (req, res) => {
     // Build SQL query - validate and sanitize inputs first to prevent SQL injection
     const warehouseValue = warehouse ? String(warehouse).toUpperCase().replace(/[^A-Z0-9\s-]/g, '') : null;
     const floorNameValue = floorName ? String(floorName).toUpperCase().replace(/[^A-Z0-9\s-]/g, '') : null;
-    const itemNamePattern = itemName ? `%${String(itemName).replace(/[%_\\]/g, '')}%` : null;
-    const enteredByPattern = enteredBy ? `%${String(enteredBy).replace(/[%_\\]/g, '')}%` : null;
+    const itemNamePattern = itemName ? `%${String(itemName).toUpperCase().replace(/[%_\\]/g, '')}%` : null;
+    const enteredByPattern = enteredBy ? `%${String(enteredBy).toUpperCase().replace(/[%_\\]/g, '')}%` : null;
     const itemTypeValue = itemType ? String(itemType).toUpperCase().replace(/[^A-Z]/g, '') : null;
     const startDateValue = startDate ? new Date(startDate as string) : null;
     const endDateValue = endDate ? new Date(endDate as string) : null;
@@ -479,13 +503,23 @@ export const getStocktakeEntries: RequestHandler = async (req, res) => {
     // Start with base query and add conditions conditionally
     let entries: any[];
 
+    // By default exclude draft entries unless includeDrafts=true is passed
+    const excludeDrafts = includeDrafts !== 'true';
+
     if (warehouseValue && floorNameValue) {
       // Most common case: warehouse + floorName - use Prisma.sql for safety
-      let query = Prisma.sql`
-        SELECT * FROM stocktake_entries
-        WHERE UPPER(warehouse) = ${warehouseValue}
-          AND UPPER(floor_name) = ${floorNameValue}
-      `;
+      let query = excludeDrafts
+        ? Prisma.sql`
+          SELECT * FROM stocktake_entries
+          WHERE UPPER(warehouse) = ${warehouseValue}
+            AND UPPER(floor_name) = ${floorNameValue}
+            AND (status IS NULL OR status != 'draft')
+        `
+        : Prisma.sql`
+          SELECT * FROM stocktake_entries
+          WHERE UPPER(warehouse) = ${warehouseValue}
+            AND UPPER(floor_name) = ${floorNameValue}
+        `;
 
       if (itemNamePattern) {
         query = Prisma.sql`${query} AND UPPER(item_name) LIKE ${itemNamePattern}`;
@@ -504,11 +538,19 @@ export const getStocktakeEntries: RequestHandler = async (req, res) => {
       }
 
       query = Prisma.sql`${query} ORDER BY created_at DESC`;
+      if (limitValue) {
+        query = Prisma.sql`${query} LIMIT ${limitValue}`;
+      }
       entries = await prisma.$queryRaw(query) as any[];
     } else {
       // Fallback for other cases - build query with validated inputs
       const whereParts: string[] = [];
-      
+
+      // Exclude drafts by default
+      if (excludeDrafts) {
+        whereParts.push(`(status IS NULL OR status != 'draft')`);
+      }
+
       if (warehouseValue) {
         whereParts.push(`UPPER(warehouse) = '${warehouseValue.replace(/'/g, "''")}'`);
       }
@@ -532,8 +574,9 @@ export const getStocktakeEntries: RequestHandler = async (req, res) => {
       }
 
       const whereClause = whereParts.length > 0 ? `WHERE ${whereParts.join(' AND ')}` : '';
-      const queryString = `SELECT * FROM stocktake_entries ${whereClause} ORDER BY created_at DESC`;
-      
+      const limitClause = limitValue ? ` LIMIT ${limitValue}` : '';
+      const queryString = `SELECT * FROM stocktake_entries ${whereClause} ORDER BY created_at DESC${limitClause}`;
+
       // Values are validated and sanitized above - safe to use $queryRawUnsafe
       entries = await prisma.$queryRawUnsafe(queryString) as any[];
     }
@@ -541,6 +584,7 @@ export const getStocktakeEntries: RequestHandler = async (req, res) => {
     // Format entries for response (convert snake_case to camelCase)
     const formattedEntries = entries.map((entry: any) => ({
       id: entry.id,
+      entryId: entry.entry_id || null,
       itemName: entry.item_name,
       itemType: entry.item_type,
       itemCategory: entry.item_category,
@@ -553,9 +597,17 @@ export const getStocktakeEntries: RequestHandler = async (req, res) => {
       enteredBy: entry.entered_by,
       enteredByEmail: entry.entered_by_email,
       authority: entry.authority,
+      stockType: entry.stock_type || "Fresh Stock",
+      verified: entry.verified || false,
+      verifiedBy: entry.verified_by || null,
+      verifiedAt: entry.verified_at ? new Date(entry.verified_at).toISOString() : null,
+      remark: entry.remark || null,
+      edits: entry.edits || [],
       createdAt: entry.created_at ? new Date(entry.created_at).toISOString() : null,
       updatedAt: entry.updated_at ? new Date(entry.updated_at).toISOString() : null,
     }));
+
+    console.log(`✅ Returning ${formattedEntries.length} entries for query`);
 
     res.json({
       success: true,
@@ -592,6 +644,7 @@ export const getGroupedStocktakeEntries: RequestHandler = async (req, res) => {
     const query = Prisma.sql`
       SELECT * FROM stocktake_entries
       WHERE UPPER(warehouse) = UPPER(${warehouseUpper}) AND UPPER(floor_name) = UPPER(${floorNameUpper})
+        AND (status IS NULL OR status != 'draft')
       ORDER BY created_at DESC
     `;
     const entries: any[] = await prisma.$queryRaw(query) as any[];
@@ -617,6 +670,7 @@ export const getGroupedStocktakeEntries: RequestHandler = async (req, res) => {
       grouped[key].entries.push({
         id: entry.id.toString(),
         description: entry.item_name,
+        itemType: entry.item_type || "",
         category: entry.item_category,
         subcategory: entry.item_subcategory,
         packageSize: parseFloat(entry.unit_uom.toString()),
@@ -625,6 +679,12 @@ export const getGroupedStocktakeEntries: RequestHandler = async (req, res) => {
         userName: entry.entered_by,
         userEmail: entry.entered_by_email,
         authority: entry.authority,
+        stockType: entry.stock_type || "Fresh Stock",
+        verified: entry.verified || false,
+        verifiedBy: entry.verified_by || null,
+        verifiedAt: entry.verified_at ? new Date(entry.verified_at).toISOString() : null,
+        remark: entry.remark || null,
+        edits: entry.edits || [],
         createdAt: entry.created_at ? new Date(entry.created_at).toISOString() : new Date().toISOString(),
       });
 
@@ -740,7 +800,10 @@ export const updateStocktakeEntry: RequestHandler<{ entryId: string }> = async (
     }
 
     // Build update query with Prisma.sql
-    if (Object.keys(updateData).length === 0) {
+    if (Object.keys(updateData).length === 0 &&
+        req.body.verified === undefined && req.body.verifiedBy === undefined &&
+        req.body.verifiedAt === undefined && req.body.remark === undefined &&
+        req.body.edits === undefined) {
       return res.status(400).json({ error: "No fields to update" });
     }
 
@@ -753,6 +816,32 @@ export const updateStocktakeEntry: RequestHandler<{ entryId: string }> = async (
       setParts.push(`${key} = $${paramIndex++}`);
       updateValues.push(updateData[key]);
     });
+
+    if (req.body.verified !== undefined) {
+      setParts.push(`verified = $${paramIndex}`);
+      updateValues.push(req.body.verified);
+      paramIndex++;
+    }
+    if (req.body.verifiedBy !== undefined) {
+      setParts.push(`verified_by = $${paramIndex}`);
+      updateValues.push(req.body.verifiedBy);
+      paramIndex++;
+    }
+    if (req.body.verifiedAt !== undefined) {
+      setParts.push(`verified_at = $${paramIndex}::timestamp`);
+      updateValues.push(req.body.verifiedAt);
+      paramIndex++;
+    }
+    if (req.body.remark !== undefined) {
+      setParts.push(`remark = $${paramIndex}`);
+      updateValues.push(req.body.remark);
+      paramIndex++;
+    }
+    if (req.body.edits !== undefined) {
+      setParts.push(`edits = $${paramIndex}::jsonb`);
+      updateValues.push(JSON.stringify(req.body.edits));
+      paramIndex++;
+    }
 
     setParts.push(`updated_at = CURRENT_TIMESTAMP`);
 
@@ -788,6 +877,11 @@ export const updateStocktakeEntry: RequestHandler<{ entryId: string }> = async (
         enteredBy: updated.entered_by,
         enteredByEmail: updated.entered_by_email,
         authority: updated.authority,
+        verified: updated.verified || false,
+        verifiedBy: updated.verified_by || null,
+        verifiedAt: updated.verified_at ? new Date(updated.verified_at).toISOString() : null,
+        remark: updated.remark || null,
+        edits: updated.edits || [],
         createdAt: updated.created_at ? new Date(updated.created_at).toISOString() : null,
         updatedAt: updated.updated_at ? new Date(updated.updated_at).toISOString() : null,
       },
@@ -829,9 +923,9 @@ export const deleteStocktakeEntry: RequestHandler<{ entryId: string }> = async (
     );
 
     // Authorization check:
-    // 1. Managers (INVENTORY_MANAGER, ADMIN) can always delete
+    // 1. SUPERUSER, INVENTORY_MANAGER, and ADMIN can always delete
     // 2. Floor managers can only delete their own entries, and only if audit is not active
-    const isManager = req.user.role === "INVENTORY_MANAGER" || req.user.role === "ADMIN";
+    const isManager = req.user.role === "SUPERUSER" || req.user.role === "INVENTORY_MANAGER" || req.user.role === "ADMIN";
     const isOwner = entry.entered_by?.toUpperCase() === req.user.email.toUpperCase() || 
                     entry.entered_by_email?.toUpperCase() === req.user.email.toUpperCase();
 
@@ -936,6 +1030,7 @@ export const saveStocktakeResultsheet: RequestHandler<
       quantity?: number;
       weight?: number;
       uom?: number;
+      stockType?: string;
     }>;
   }
 > = async (req, res) => {
@@ -970,6 +1065,7 @@ export const saveStocktakeResultsheet: RequestHandler<
       enteredBy: string;
       enteredByEmail: string | null;
       authority: string;
+      stockType: string;
     }> = [];
 
     // Validate and process all entries
@@ -988,6 +1084,7 @@ export const saveStocktakeResultsheet: RequestHandler<
       const enteredBy = (req.user?.email || "MANAGER").toUpperCase();
       const enteredByEmail = req.user?.email || null;
       const authority = "MANAGER";
+      const stockType = (entry.stockType || entryAny.stockType || "Fresh Stock").toString().trim();
 
       // Validate required fields
       if (!itemName || !warehouse || !floorName) {
@@ -1021,6 +1118,7 @@ export const saveStocktakeResultsheet: RequestHandler<
         enteredBy,
         enteredByEmail,
         authority,
+        stockType,
       });
     }
 
@@ -1043,10 +1141,10 @@ export const saveStocktakeResultsheet: RequestHandler<
         INSERT INTO stocktake_entries (
           item_name, item_type, item_category, item_subcategory,
           floor_name, warehouse, total_quantity, unit_uom, total_weight,
-          entered_by, entered_by_email, authority, created_at, updated_at
+          entered_by, entered_by_email, authority, stock_type, created_at, updated_at
         ) VALUES (${entry.itemName}, ${entry.itemType}, ${entry.itemCategory}, ${entry.itemSubcategory},
           ${entry.floorName}, ${entry.warehouse}, ${entry.totalQuantity}, ${entry.unitUom}, ${entry.totalWeight},
-          ${entry.enteredBy}, ${entry.enteredByEmail || null}, ${entry.authority}, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+          ${entry.enteredBy}, ${entry.enteredByEmail || null}, ${entry.authority}, ${entry.stockType}, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         RETURNING id, item_name, warehouse, floor_name
       `;
 
@@ -1056,7 +1154,8 @@ export const saveStocktakeResultsheet: RequestHandler<
 
     const insertedEntries = await Promise.all(entriesInsertPromises);
 
-    // Aggregate entries for resultsheet (group by item_name, category, subcategory, warehouse, floor_name)
+    // Aggregate entries for resultsheet (group by item_name, category, subcategory, warehouse, floor_name, stock_type)
+    // NOTE: item_type is NOT included in the key - same items are summed regardless of item_type
     const aggregatedForResultsheet: Record<string, {
       item_name: string;
       item_type: string;
@@ -1064,81 +1163,100 @@ export const saveStocktakeResultsheet: RequestHandler<
       subgroup: string;
       warehouse: string;
       floor_name: string;
+      stock_type: string;
       total_weight: number;
       total_quantity: number;
       uom: number;
     }> = {};
 
     processedEntries.forEach((entry) => {
-      // Include item_type in the aggregation key to keep items with different types separate
-      const key = `${entry.itemName}_${entry.itemType}_${entry.itemCategory}_${entry.itemSubcategory}_${entry.warehouse}_${entry.floorName}`.toUpperCase();
-      
+      // DO NOT include item_type in the key - same items with different item_types should be summed together
+      const key = `${entry.itemName}_${entry.itemCategory}_${entry.itemSubcategory}_${entry.warehouse}_${entry.floorName}_${entry.stockType}`.toUpperCase();
+
       if (!aggregatedForResultsheet[key]) {
         aggregatedForResultsheet[key] = {
           item_name: entry.itemName,
-          item_type: entry.itemType,
+          item_type: entry.itemType, // Keep first item_type encountered
           group: entry.itemCategory,
           subgroup: entry.itemSubcategory,
           warehouse: entry.warehouse,
           floor_name: entry.floorName,
+          stock_type: entry.stockType,
           total_weight: 0,
           total_quantity: 0,
           uom: entry.unitUom,
         };
+      } else if (entry.itemType && !aggregatedForResultsheet[key].item_type) {
+        // If current entry has item_type and existing doesn't, use current item_type
+        aggregatedForResultsheet[key].item_type = entry.itemType;
       }
-      
+
       aggregatedForResultsheet[key].total_weight += entry.totalWeight;
       aggregatedForResultsheet[key].total_quantity += entry.totalQuantity;
     });
 
+    // Ensure stock_type column exists in stocktake_resultsheet table
+    try {
+      await prisma.$executeRawUnsafe(`
+        ALTER TABLE stocktake_resultsheet
+        ADD COLUMN IF NOT EXISTS stock_type VARCHAR(50) DEFAULT 'Fresh Stock'
+      `);
+    } catch (alterError) {
+      // Column might already exist - ignore error
+      console.log("stock_type column check completed");
+    }
+
     // Insert aggregated data into stocktake_resultsheet
     // Check if record exists first, then update or insert
     const resultsheetInsertPromises = Object.values(aggregatedForResultsheet).map(async (agg) => {
-      // First check if a record exists for this combination (including item_type)
+      // First check if a record exists for this combination (NOT including item_type - same items summed together)
       const checkQuery = Prisma.sql`
-        SELECT id, weight, quantity 
+        SELECT id, weight, quantity, item_type
         FROM stocktake_resultsheet
         WHERE item_name = ${agg.item_name}
-          AND item_type = ${agg.item_type}
           AND "group" = ${agg.group}
           AND subgroup = ${agg.subgroup}
           AND warehouse = ${agg.warehouse}
           AND floor_name = ${agg.floor_name}
+          AND COALESCE(stock_type, 'Fresh Stock') = ${agg.stock_type}
           AND date = ${dateStr}::date
         LIMIT 1
       `;
-      
+
       const existing: any[] = await prisma.$queryRaw(checkQuery) as any[];
-      
+
       if (existing.length > 0) {
-        // Record exists, update it
+        // Record exists, update it (sum quantities/weights)
         const existingRecord = existing[0];
         const newWeight = parseFloat(existingRecord.weight?.toString() || "0") + agg.total_weight;
         const newQuantity = parseFloat(existingRecord.quantity?.toString() || "0") + agg.total_quantity;
-        
+        // Keep existing item_type if it has one, otherwise use the new one
+        const finalItemType = existingRecord.item_type || agg.item_type || "";
+
         const updateQuery = Prisma.sql`
           UPDATE stocktake_resultsheet
-          SET 
-            item_type = ${agg.item_type},
+          SET
+            item_type = ${finalItemType},
+            stock_type = ${agg.stock_type},
             weight = ${newWeight},
             quantity = ${newQuantity},
             updated_at = CURRENT_TIMESTAMP
           WHERE id = ${existingRecord.id}
         `;
-        
+
         await prisma.$executeRaw(updateQuery);
-        console.log(`  ✓ Updated existing resultsheet entry: ${agg.item_name} (${agg.warehouse}/${agg.floor_name})`);
+        console.log(`  ✓ Updated existing resultsheet entry: ${agg.item_name} (${agg.warehouse}/${agg.floor_name}) [${agg.stock_type}] - Qty: ${newQuantity}, Weight: ${newWeight}kg`);
         return { action: 'updated', id: existingRecord.id };
       } else {
         // Record doesn't exist, insert it
         const insertQuery = Prisma.sql`
-          INSERT INTO stocktake_resultsheet (item_name, item_type, "group", subgroup, warehouse, floor_name, weight, quantity, uom, date, created_at, updated_at)
-          VALUES (${agg.item_name}, ${agg.item_type}, ${agg.group}, ${agg.subgroup}, ${agg.warehouse}, ${agg.floor_name}, ${agg.total_weight}, ${agg.total_quantity}, ${agg.uom}, ${dateStr}::date, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+          INSERT INTO stocktake_resultsheet (item_name, item_type, "group", subgroup, warehouse, floor_name, stock_type, weight, quantity, uom, date, created_at, updated_at)
+          VALUES (${agg.item_name}, ${agg.item_type}, ${agg.group}, ${agg.subgroup}, ${agg.warehouse}, ${agg.floor_name}, ${agg.stock_type}, ${agg.total_weight}, ${agg.total_quantity}, ${agg.uom}, ${dateStr}::date, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
           RETURNING id
         `;
-        
+
         const inserted: any[] = await prisma.$queryRaw(insertQuery) as any[];
-        console.log(`  ✓ Inserted new resultsheet entry: ${agg.item_name} (${agg.warehouse}/${agg.floor_name})`);
+        console.log(`  ✓ Inserted new resultsheet entry: ${agg.item_name} (${agg.warehouse}/${agg.floor_name}) [${agg.stock_type}]`);
         return { action: 'inserted', id: inserted[0]?.id };
       }
     });
@@ -1198,9 +1316,9 @@ export const clearAllEntries: RequestHandler = async (req, res) => {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    // Only allow managers and admins to clear entries
-    if (req.user.role !== "INVENTORY_MANAGER" && req.user.role !== "ADMIN") {
-      return res.status(403).json({ error: "Only managers and admins can clear entries" });
+    // Only allow superuser to clear entries
+    if (req.user.role !== "SUPERUSER") {
+      return res.status(403).json({ error: "Only superuser can clear entries" });
     }
 
     // Delete all entries from stocktake_entries table
@@ -1217,6 +1335,91 @@ export const clearAllEntries: RequestHandler = async (req, res) => {
     });
   } catch (error: any) {
     console.error("Clear all entries error:", error);
+    res.status(500).json({
+      error: "Internal server error",
+      details: error.message,
+    });
+  }
+};
+
+export const clearWarehouseEntries: RequestHandler = async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    // Only allow superuser to clear warehouse entries
+    if (req.user.role !== "SUPERUSER") {
+      return res.status(403).json({ error: "Only superuser can clear warehouse entries" });
+    }
+
+    const { warehouse } = req.params;
+
+    if (!warehouse) {
+      return res.status(400).json({ error: "Warehouse name is required" });
+    }
+
+    // Delete all entries for the specified warehouse
+    const deleteQuery = Prisma.sql`
+      DELETE FROM stocktake_entries
+      WHERE warehouse = ${warehouse}
+      RETURNING id
+    `;
+    const deleted: any[] = await prisma.$queryRaw(deleteQuery) as any[];
+
+    res.json({
+      success: true,
+      message: `All entries for warehouse ${warehouse} cleared successfully`,
+      deletedCount: deleted.length,
+      warehouse,
+    });
+  } catch (error: any) {
+    console.error("Clear warehouse entries error:", error);
+    res.status(500).json({
+      error: "Internal server error",
+      details: error.message,
+    });
+  }
+};
+
+export const clearFloorEntries: RequestHandler = async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    // Only allow superuser to clear floor entries
+    if (req.user.role !== "SUPERUSER") {
+      return res.status(403).json({ error: "Only superuser can clear floor entries" });
+    }
+
+    const { warehouse, floor } = req.params;
+
+    if (!warehouse) {
+      return res.status(400).json({ error: "Warehouse name is required" });
+    }
+
+    if (!floor) {
+      return res.status(400).json({ error: "Floor name is required" });
+    }
+
+    // Delete all entries for the specified warehouse and floor
+    const deleteQuery = Prisma.sql`
+      DELETE FROM stocktake_entries
+      WHERE warehouse = ${warehouse} AND floor_name = ${floor}
+      RETURNING id
+    `;
+    const deleted: any[] = await prisma.$queryRaw(deleteQuery) as any[];
+
+    res.json({
+      success: true,
+      message: `All entries for ${warehouse} - ${floor} cleared successfully`,
+      deletedCount: deleted.length,
+      warehouse,
+      floor,
+    });
+  } catch (error: any) {
+    console.error("Clear floor entries error:", error);
     res.status(500).json({
       error: "Internal server error",
       details: error.message,
@@ -1287,7 +1490,7 @@ export const getResultsheetData: RequestHandler<{ date: string }> = async (req, 
     }
 
     const { date } = req.params;
-    
+
     if (!date) {
       return res.status(400).json({ error: "Date parameter is required" });
     }
@@ -1298,15 +1501,16 @@ export const getResultsheetData: RequestHandler<{ date: string }> = async (req, 
       return res.status(400).json({ error: "Invalid date format" });
     }
 
-    // Get all resultsheet entries for this date
+    // Get all resultsheet entries for this date (including stock_type)
     const query = Prisma.sql`
-      SELECT 
+      SELECT
         item_name,
         item_type,
         "group",
         subgroup,
         warehouse,
         floor_name,
+        COALESCE(stock_type, 'Fresh Stock') as stock_type,
         weight,
         quantity,
         uom,
@@ -1314,103 +1518,130 @@ export const getResultsheetData: RequestHandler<{ date: string }> = async (req, 
         created_at
       FROM stocktake_resultsheet
       WHERE date = ${date}::date
-      ORDER BY item_name, warehouse, floor_name
+      ORDER BY stock_type ASC, item_name, warehouse, floor_name
     `;
-    
+
     const entries: any[] = await prisma.$queryRaw(query) as any[];
 
     if (entries.length === 0) {
       return res.json({
         success: true,
         date,
+        freshStock: { items: [], warehouses: [], data: {} },
+        rejection: { items: [], warehouses: [], data: {} },
         items: [],
         warehouses: [],
         data: {},
       });
     }
 
-    // Transform data into table format:
-    // - Rows: Item names (grouped by item_name, group, subgroup)
-    // - Columns: Warehouses
-    // - Sub-columns: Floor names within each warehouse
-    // - Data: Weight
-
-    // Get unique items
-    const itemsMap = new Map<string, {
-      item_name: string;
-      item_type: string;
-      group: string;
-      subgroup: string;
-    }>();
-
-    // Get unique warehouses and floors
-    const warehousesSet = new Set<string>();
-    const floorsByWarehouse = new Map<string, Set<string>>();
-
-    entries.forEach((entry: any) => {
-      // Include item_type in the key to keep items with same name but different types separate
-      const itemType = entry.item_type?.toString().trim().toUpperCase() || "";
-      const itemKey = `${entry.item_name?.toUpperCase() || ""}_${itemType}`;
-      if (!itemsMap.has(itemKey)) {
-        itemsMap.set(itemKey, {
-          item_name: entry.item_name,
-          item_type: entry.item_type?.toString().trim() || "",
-          group: entry.group || "",
-          subgroup: entry.subgroup || "",
-        });
-      }
-
-      const warehouse = entry.warehouse?.toUpperCase() || "";
-      const floorName = entry.floor_name?.toUpperCase() || "";
-      
-      warehousesSet.add(warehouse);
-      
-      if (!floorsByWarehouse.has(warehouse)) {
-        floorsByWarehouse.set(warehouse, new Set());
-      }
-      floorsByWarehouse.get(warehouse)?.add(floorName);
-    });
-
-    // Build data structure: item -> warehouse -> floor -> { weight, quantity, uom }
-    const data: Record<string, Record<string, Record<string, { weight: number; quantity: number; uom: number }>>> = {};
-
-    entries.forEach((entry: any) => {
-      // Use item_name + item_type as key to match the itemsMap key
-      const itemType = entry.item_type?.toString().trim().toUpperCase() || "";
-      const itemKey = `${entry.item_name?.toUpperCase() || ""}_${itemType}`;
-      const warehouse = entry.warehouse?.toUpperCase() || "";
-      const floorName = entry.floor_name?.toUpperCase() || "";
-      const weight = parseFloat(entry.weight?.toString() || "0");
-      const quantity = parseFloat(entry.quantity?.toString() || "0");
-      const uom = parseFloat(entry.uom?.toString() || "0");
-
-      if (!data[itemKey]) {
-        data[itemKey] = {};
-      }
-      if (!data[itemKey][warehouse]) {
-        data[itemKey][warehouse] = {};
-      }
-      data[itemKey][warehouse][floorName] = { weight, quantity, uom };
-    });
-
-    // Convert to arrays for easier frontend handling
-    const items = Array.from(itemsMap.values()).sort((a, b) => 
-      a.item_name.localeCompare(b.item_name)
+    // Separate entries by stock type
+    const freshStockEntries = entries.filter((e: any) =>
+      !e.stock_type || e.stock_type === "Fresh Stock"
     );
-    const warehouses = Array.from(warehousesSet).sort();
+    const rejectionEntries = entries.filter((e: any) =>
+      e.stock_type === "Off Grade/Rejection" || e.stock_type === "Rejection"
+    );
 
-    // Build warehouse structure with floors
-    const warehouseStructure = warehouses.map(warehouse => ({
-      name: warehouse,
-      floors: Array.from(floorsByWarehouse.get(warehouse) || []).sort(),
-    }));
+    // Helper function to process entries into table format
+    // NOTE: Same items (same name, group, subgroup) are aggregated regardless of item_type
+    const processEntries = (entryList: any[]) => {
+      const itemsMap = new Map<string, {
+        item_name: string;
+        item_type: string;
+        group: string;
+        subgroup: string;
+        stock_type: string;
+      }>();
+
+      const warehousesSet = new Set<string>();
+      const floorsByWarehouse = new Map<string, Set<string>>();
+
+      entryList.forEach((entry: any) => {
+        // DO NOT include item_type in the key - same items are combined regardless of item_type
+        const itemKey = `${entry.item_name?.toUpperCase() || ""}_${(entry.group || "").toUpperCase()}_${(entry.subgroup || "").toUpperCase()}`;
+        if (!itemsMap.has(itemKey)) {
+          itemsMap.set(itemKey, {
+            item_name: entry.item_name,
+            item_type: entry.item_type?.toString().trim() || "",
+            group: entry.group || "",
+            subgroup: entry.subgroup || "",
+            stock_type: entry.stock_type || "Fresh Stock",
+          });
+        } else if (entry.item_type && !itemsMap.get(itemKey)?.item_type) {
+          // If current entry has item_type and existing doesn't, update it
+          const existing = itemsMap.get(itemKey)!;
+          existing.item_type = entry.item_type?.toString().trim() || "";
+        }
+
+        const warehouse = entry.warehouse?.toUpperCase() || "";
+        const floorName = entry.floor_name?.toUpperCase() || "";
+
+        warehousesSet.add(warehouse);
+
+        if (!floorsByWarehouse.has(warehouse)) {
+          floorsByWarehouse.set(warehouse, new Set());
+        }
+        floorsByWarehouse.get(warehouse)?.add(floorName);
+      });
+
+      const data: Record<string, Record<string, Record<string, { weight: number; quantity: number; uom: number }>>> = {};
+
+      entryList.forEach((entry: any) => {
+        // Use same key as itemsMap (without item_type) to ensure data matches items
+        const itemKey = `${entry.item_name?.toUpperCase() || ""}_${(entry.group || "").toUpperCase()}_${(entry.subgroup || "").toUpperCase()}`;
+        const warehouse = entry.warehouse?.toUpperCase() || "";
+        const floorName = entry.floor_name?.toUpperCase() || "";
+        const weight = parseFloat(entry.weight?.toString() || "0");
+        const quantity = parseFloat(entry.quantity?.toString() || "0");
+        const uom = parseFloat(entry.uom?.toString() || "0");
+
+        if (!data[itemKey]) {
+          data[itemKey] = {};
+        }
+        if (!data[itemKey][warehouse]) {
+          data[itemKey][warehouse] = {};
+        }
+        // Sum up weights and quantities for same item/warehouse/floor
+        if (!data[itemKey][warehouse][floorName]) {
+          data[itemKey][warehouse][floorName] = { weight: 0, quantity: 0, uom };
+        }
+        data[itemKey][warehouse][floorName].weight += weight;
+        data[itemKey][warehouse][floorName].quantity += quantity;
+        if (uom > 0 && data[itemKey][warehouse][floorName].uom === 0) {
+          data[itemKey][warehouse][floorName].uom = uom;
+        }
+      });
+
+      const items = Array.from(itemsMap.values()).sort((a, b) =>
+        a.item_name.localeCompare(b.item_name)
+      );
+      const warehouses = Array.from(warehousesSet).sort();
+      const warehouseStructure = warehouses.map(warehouse => ({
+        name: warehouse,
+        floors: Array.from(floorsByWarehouse.get(warehouse) || []).sort(),
+      }));
+
+      return { items, warehouses: warehouseStructure, data };
+    };
+
+    // Process Fresh Stock and Rejection separately
+    const freshStockData = processEntries(freshStockEntries);
+    const rejectionData = processEntries(rejectionEntries);
+
+    // Also process combined data for backwards compatibility
+    const combinedData = processEntries(entries);
 
     res.json({
       success: true,
       date,
-      items,
-      warehouses: warehouseStructure,
-      data,
+      // Separated data for new feature
+      freshStock: freshStockData,
+      rejection: rejectionData,
+      // Combined data for backwards compatibility
+      items: combinedData.items,
+      warehouses: combinedData.warehouses,
+      data: combinedData.data,
     });
   } catch (error: any) {
     console.error("Get resultsheet data error:", error);
@@ -1421,14 +1652,169 @@ export const getResultsheetData: RequestHandler<{ date: string }> = async (req, 
   }
 };
 
-// Search item descriptions from categorial_inv table
+// Get merged resultsheet data for multiple dates (used for weekly merge/download)
+export const getResultsheetMultiDate: RequestHandler = async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const { dates } = req.query;
+    if (!dates || typeof dates !== "string") {
+      return res.status(400).json({ error: "dates query parameter required (comma-separated YYYY-MM-DD)" });
+    }
+
+    const dateList = dates.split(",").map(d => d.trim()).filter(Boolean);
+    if (dateList.length === 0 || dateList.length > 14) {
+      return res.status(400).json({ error: "Provide 1-14 comma-separated dates" });
+    }
+
+    // Validate all dates
+    for (const d of dateList) {
+      if (isNaN(new Date(d).getTime())) {
+        return res.status(400).json({ error: `Invalid date: ${d}` });
+      }
+    }
+
+    // Query all entries for the given dates
+    const placeholders = dateList.map((_, i) => `$${i + 1}::date`).join(", ");
+    const query = Prisma.sql`
+      SELECT
+        item_name,
+        item_type,
+        "group",
+        subgroup,
+        warehouse,
+        floor_name,
+        COALESCE(stock_type, 'Fresh Stock') as stock_type,
+        weight,
+        quantity,
+        uom,
+        date,
+        created_at
+      FROM stocktake_resultsheet
+      WHERE date = ANY(${dateList}::date[])
+      ORDER BY stock_type ASC, item_name, warehouse, floor_name
+    `;
+
+    const entries: any[] = await prisma.$queryRaw(query) as any[];
+
+    if (entries.length === 0) {
+      return res.json({
+        success: true,
+        dates: dateList,
+        freshStock: { items: [], warehouses: [], data: {} },
+        rejection: { items: [], warehouses: [], data: {} },
+        items: [],
+        warehouses: [],
+        data: {},
+      });
+    }
+
+    const freshStockEntries = entries.filter((e: any) =>
+      !e.stock_type || e.stock_type === "Fresh Stock"
+    );
+    const rejectionEntries = entries.filter((e: any) =>
+      e.stock_type === "Off Grade/Rejection" || e.stock_type === "Rejection"
+    );
+
+    // Reuse the same processEntries logic as getResultsheetData
+    const processEntries = (entryList: any[]) => {
+      const itemsMap = new Map<string, {
+        item_name: string;
+        item_type: string;
+        group: string;
+        subgroup: string;
+        stock_type: string;
+      }>();
+
+      const warehousesSet = new Set<string>();
+      const floorsByWarehouse = new Map<string, Set<string>>();
+
+      entryList.forEach((entry: any) => {
+        const itemKey = `${entry.item_name?.toUpperCase() || ""}_${(entry.group || "").toUpperCase()}_${(entry.subgroup || "").toUpperCase()}`;
+        if (!itemsMap.has(itemKey)) {
+          itemsMap.set(itemKey, {
+            item_name: entry.item_name,
+            item_type: entry.item_type?.toString().trim() || "",
+            group: entry.group || "",
+            subgroup: entry.subgroup || "",
+            stock_type: entry.stock_type || "Fresh Stock",
+          });
+        } else if (entry.item_type && !itemsMap.get(itemKey)?.item_type) {
+          const existing = itemsMap.get(itemKey)!;
+          existing.item_type = entry.item_type?.toString().trim() || "";
+        }
+
+        const warehouse = entry.warehouse?.toUpperCase() || "";
+        const floorName = entry.floor_name?.toUpperCase() || "";
+        warehousesSet.add(warehouse);
+        if (!floorsByWarehouse.has(warehouse)) {
+          floorsByWarehouse.set(warehouse, new Set());
+        }
+        floorsByWarehouse.get(warehouse)?.add(floorName);
+      });
+
+      const data: Record<string, Record<string, Record<string, { weight: number; quantity: number; uom: number }>>> = {};
+
+      entryList.forEach((entry: any) => {
+        const itemKey = `${entry.item_name?.toUpperCase() || ""}_${(entry.group || "").toUpperCase()}_${(entry.subgroup || "").toUpperCase()}`;
+        const warehouse = entry.warehouse?.toUpperCase() || "";
+        const floorName = entry.floor_name?.toUpperCase() || "";
+        const weight = parseFloat(entry.weight?.toString() || "0");
+        const quantity = parseFloat(entry.quantity?.toString() || "0");
+        const uom = parseFloat(entry.uom?.toString() || "0");
+
+        if (!data[itemKey]) data[itemKey] = {};
+        if (!data[itemKey][warehouse]) data[itemKey][warehouse] = {};
+        if (!data[itemKey][warehouse][floorName]) {
+          data[itemKey][warehouse][floorName] = { weight: 0, quantity: 0, uom };
+        }
+        data[itemKey][warehouse][floorName].weight += weight;
+        data[itemKey][warehouse][floorName].quantity += quantity;
+        if (uom > 0 && data[itemKey][warehouse][floorName].uom === 0) {
+          data[itemKey][warehouse][floorName].uom = uom;
+        }
+      });
+
+      const items = Array.from(itemsMap.values()).sort((a, b) =>
+        a.item_name.localeCompare(b.item_name)
+      );
+      const warehouses = Array.from(warehousesSet).sort();
+      const warehouseStructure = warehouses.map(warehouse => ({
+        name: warehouse,
+        floors: Array.from(floorsByWarehouse.get(warehouse) || []).sort(),
+      }));
+
+      return { items, warehouses: warehouseStructure, data };
+    };
+
+    const freshStockData = processEntries(freshStockEntries);
+    const rejectionData = processEntries(rejectionEntries);
+    const combinedData = processEntries(entries);
+
+    res.json({
+      success: true,
+      dates: dateList,
+      freshStock: freshStockData,
+      rejection: rejectionData,
+      items: combinedData.items,
+      warehouses: combinedData.warehouses,
+      data: combinedData.data,
+    });
+  } catch (error: any) {
+    console.error("Get resultsheet multi-date error:", error);
+    res.status(500).json({ error: "Internal server error", details: error.message });
+  }
+};
+
+// Search item descriptions from all_sku table
 export const searchItemDescriptions: RequestHandler<{ itemType: string }> = async (req, res) => {
   try {
     if (!req.user) {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    // itemType comes from URL path parameter, query comes from query string
     const { itemType } = req.params;
     const { query } = req.query;
 
@@ -1441,82 +1827,38 @@ export const searchItemDescriptions: RequestHandler<{ itemType: string }> = asyn
     }
 
     const itemTypeValue = itemType.toLowerCase();
-    // Normalize search query - keep original case for user input
     const searchQuery = (query as string).trim();
 
     if (searchQuery.length < 2) {
       return res.json({ success: true, results: [] });
     }
 
-    // Sanitize search query to prevent SQL injection
-    // Convert to uppercase for case-insensitive search (matching database storage pattern)
     const sanitizedQuery = searchQuery.replace(/[%_\\]/g, "\\$&");
     const searchPattern = `%${sanitizedQuery}%`;
 
-    // Try different column names for item type, similar to getCategorialInventory
-    // Use case-insensitive search on particulars column - works with both uppercase and lowercase input
-    // For SELECT DISTINCT with ORDER BY in PostgreSQL, the ORDER BY expression must appear in SELECT list
-    let data;
-    const queries = [
-      Prisma.sql`
-        SELECT DISTINCT 
-          "group", 
-          "sub_group", 
-          "particulars", 
-          "uom",
-          LOWER(TRIM(CAST("particulars" AS VARCHAR))) as particulars_lower
-        FROM categorial_inv 
-        WHERE UPPER("fg/rm/pm") = UPPER(${itemTypeValue})
-          AND LOWER(TRIM(CAST("particulars" AS VARCHAR))) LIKE LOWER(${searchPattern})
-          AND "group" IS NOT NULL 
-          AND TRIM(CAST("group" AS VARCHAR)) != ''
-        ORDER BY particulars_lower
-        LIMIT 50
-      `,
-      Prisma.sql`
-        SELECT DISTINCT 
-          "group", 
-          "sub_group", 
-          "particulars", 
-          uom,
-          LOWER(TRIM(CAST("particulars" AS VARCHAR))) as particulars_lower
-        FROM categorial_inv 
-        WHERE UPPER("fg/rm/pm") = UPPER(${itemTypeValue})
-          AND LOWER(TRIM(CAST("particulars" AS VARCHAR))) LIKE LOWER(${searchPattern})
-          AND "group" IS NOT NULL 
-          AND TRIM(CAST("group" AS VARCHAR)) != ''
-        ORDER BY particulars_lower
-        LIMIT 50
-      `,
-    ];
+    const data: any[] = await prisma.$queryRaw(Prisma.sql`
+      SELECT DISTINCT
+        item_group,
+        sub_group,
+        particulars,
+        uom,
+        LOWER(TRIM(CAST(particulars AS VARCHAR))) as particulars_lower
+      FROM all_sku
+      WHERE LOWER(item_type) = LOWER(${itemTypeValue})
+        AND LOWER(TRIM(CAST(particulars AS VARCHAR))) LIKE LOWER(${searchPattern})
+        AND item_group IS NOT NULL
+        AND TRIM(CAST(item_group AS VARCHAR)) != ''
+      ORDER BY particulars_lower
+      LIMIT 50
+    `);
 
-    let lastError: any = null;
-    for (let i = 0; i < queries.length; i++) {
-      try {
-        data = await prisma.$queryRaw(queries[i]);
-        console.log(`Successfully searched using query attempt ${i + 1}`);
-        break;
-      } catch (error: any) {
-        console.error(`Search query error with attempt ${i + 1}:`, error.message);
-        lastError = error;
-        if (i === queries.length - 1) {
-          return res.status(500).json({
-            error: "Unable to search categorial_inv table",
-            details: lastError?.message,
-          });
-        }
-        continue;
-      }
-    }
-
-    // Format results
-    const results = (data as any[]).map((row: any) => {
-      const group = (row.group || row.Group || row["group"] || "").toString().trim().toUpperCase();
-      const subgroup = (row.sub_group || row.subgroup || row.SubGroup || row.Subgroup || row["sub_group"] || "").toString().trim().toUpperCase();
-      const particulars = (row.particulars || row.Particulars || row["particulars"] || "").toString().trim().toUpperCase();
-      const uom = row.uom || row.UOM || row.Uom || row["uom"] || null;
+    const results = data.map((row: any) => {
+      const group = (row.item_group || "").toString().trim().toUpperCase();
+      const subgroup = (row.sub_group || "").toString().trim().toUpperCase();
+      const particulars = (row.particulars || "").toString().trim().toUpperCase();
+      const uom = row.uom;
       let uomValue: number | null = null;
-      
+
       if (uom !== null && uom !== undefined && uom !== '') {
         const parsedUom = parseFloat(uom.toString());
         if (!isNaN(parsedUom)) {
@@ -1524,12 +1866,7 @@ export const searchItemDescriptions: RequestHandler<{ itemType: string }> = asyn
         }
       }
 
-      return {
-        group,
-        subgroup,
-        particulars,
-        uom: uomValue,
-      };
+      return { group, subgroup, particulars, uom: uomValue };
     }).filter((item: any) => item.group && item.subgroup && item.particulars);
 
     res.json({
@@ -1553,9 +1890,9 @@ export const deleteResultsheet: RequestHandler<{ date: string }> = async (req, r
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    // Only allow managers and admins to delete resultsheets
-    if (req.user.role !== "INVENTORY_MANAGER" && req.user.role !== "ADMIN") {
-      return res.status(403).json({ error: "Only managers and admins can delete resultsheets" });
+    // Only allow superuser to delete resultsheets
+    if (req.user.role !== "SUPERUSER") {
+      return res.status(403).json({ error: "Only superuser can delete resultsheets" });
     }
 
     const { date } = req.params;
@@ -1591,5 +1928,405 @@ export const deleteResultsheet: RequestHandler<{ date: string }> = async (req, r
       error: "Internal server error",
       details: error.message,
     });
+  }
+};
+
+// ============ Draft Entry Endpoints ============
+
+// Add a single draft entry (called when user clicks "Add Article")
+export const addDraftEntry: RequestHandler = async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const entry = req.body;
+
+    const itemName = (entry.item_name || entry.itemName || entry.description || "UNSPECIFIED").toUpperCase();
+    const itemType = (entry.item_type || entry.itemType || "FG").toUpperCase();
+    const itemCategory = (entry.item_category || entry.category || entry.itemCategory || "GENERAL").toUpperCase();
+    const itemSubcategory = (entry.item_subcategory || entry.subcategory || entry.itemSubcategory || "OTHER").toUpperCase();
+    const floorName = (entry.floor_name || entry.floorName || entry.floor || "MAIN").toUpperCase();
+    const warehouse = (entry.warehouse || "MAIN").toUpperCase();
+    const totalQuantity = parseFloat(entry.total_quantity || entry.units || entry.totalQuantity || "0") || 0;
+    const unitUom = parseFloat(entry.unit_uom || entry.packageSize || entry.unitUom || 0) || 0;
+    const totalWeight = parseFloat(entry.total_weight || entry.totalWeight || (totalQuantity * unitUom).toFixed(2)) || 0;
+    const enteredBy = (entry.entered_by || entry.enteredBy || entry.userName || "UNKNOWN").toUpperCase();
+    const enteredByEmail = entry.entered_by_email || entry.enteredByEmail || entry.userEmail || null;
+    const authority = (entry.authority || "FLOOR_MANAGER").toUpperCase();
+    const stockType = entry.stock_type || entry.stockType || "Fresh Stock";
+    const edits = entry.edits ? JSON.stringify(entry.edits) : null;
+
+    const query = Prisma.sql`
+      INSERT INTO stocktake_entries (
+        item_name, item_type, item_category, item_subcategory,
+        floor_name, warehouse, total_quantity, unit_uom, total_weight,
+        entered_by, entered_by_email, authority, stock_type, status, edits, created_at, updated_at
+      ) VALUES (${itemName}, ${itemType}, ${itemCategory}, ${itemSubcategory},
+        ${floorName}, ${warehouse}, ${totalQuantity}, ${unitUom}, ${totalWeight},
+        ${enteredBy}, ${enteredByEmail}, ${authority}, ${stockType}, 'draft', ${edits}::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      RETURNING id, item_name, item_type, item_category, item_subcategory, floor_name, warehouse,
+                total_quantity, unit_uom, total_weight, entered_by, entered_by_email, authority,
+                stock_type, status, entry_id, edits, created_at
+    `;
+
+    const inserted: any[] = await prisma.$queryRaw(query) as any[];
+    const row = inserted[0];
+
+    res.json({
+      success: true,
+      entry: {
+        id: row.id,
+        entryId: row.entry_id || null,
+        itemName: row.item_name,
+        itemType: row.item_type,
+        itemCategory: row.item_category,
+        itemSubcategory: row.item_subcategory,
+        floorName: row.floor_name,
+        warehouse: row.warehouse,
+        totalQuantity: parseFloat(row.total_quantity?.toString() || "0"),
+        unitUom: parseFloat(row.unit_uom?.toString() || "0"),
+        totalWeight: parseFloat(row.total_weight?.toString() || "0"),
+        enteredBy: row.entered_by,
+        enteredByEmail: row.entered_by_email,
+        authority: row.authority,
+        stockType: row.stock_type,
+        status: row.status,
+        createdAt: row.created_at ? new Date(row.created_at).toISOString() : null,
+      },
+    });
+  } catch (error: any) {
+    console.error("Add draft entry error:", error);
+    res.status(500).json({ error: "Internal server error", details: error.message });
+  }
+};
+
+// Get draft entries for a user (filtered by warehouse + floor)
+export const getDraftEntries: RequestHandler = async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const { warehouse, floorName, enteredBy, enteredByEmail } = req.query;
+
+    // Build query - at minimum filter by status='draft'
+    let query;
+    const emailFilter = enteredByEmail || req.user.email;
+
+    if (warehouse && floorName) {
+      query = Prisma.sql`
+        SELECT * FROM stocktake_entries
+        WHERE status = 'draft'
+          AND UPPER(entered_by_email) = UPPER(${String(emailFilter)})
+          AND UPPER(warehouse) = UPPER(${String(warehouse)})
+          AND UPPER(floor_name) = UPPER(${String(floorName)})
+        ORDER BY created_at ASC
+      `;
+    } else if (emailFilter) {
+      query = Prisma.sql`
+        SELECT * FROM stocktake_entries
+        WHERE status = 'draft'
+          AND UPPER(entered_by_email) = UPPER(${String(emailFilter)})
+        ORDER BY created_at ASC
+      `;
+    } else {
+      query = Prisma.sql`
+        SELECT * FROM stocktake_entries
+        WHERE status = 'draft'
+        ORDER BY created_at ASC
+      `;
+    }
+
+    const entries: any[] = await prisma.$queryRaw(query) as any[];
+
+    const formattedEntries = entries.map((entry: any) => ({
+      id: entry.id,
+      entryId: entry.entry_id || null,
+      itemName: entry.item_name,
+      itemType: entry.item_type,
+      itemCategory: entry.item_category,
+      itemSubcategory: entry.item_subcategory,
+      floorName: entry.floor_name,
+      warehouse: entry.warehouse,
+      totalQuantity: parseFloat(entry.total_quantity?.toString() || "0"),
+      unitUom: parseFloat(entry.unit_uom?.toString() || "0"),
+      totalWeight: parseFloat(entry.total_weight?.toString() || "0"),
+      enteredBy: entry.entered_by,
+      enteredByEmail: entry.entered_by_email,
+      authority: entry.authority,
+      stockType: entry.stock_type || "Fresh Stock",
+      status: entry.status,
+      edits: entry.edits || [],
+      createdAt: entry.created_at ? new Date(entry.created_at).toISOString() : null,
+      updatedAt: entry.updated_at ? new Date(entry.updated_at).toISOString() : null,
+    }));
+
+    res.json({
+      success: true,
+      entries: formattedEntries,
+      count: formattedEntries.length,
+    });
+  } catch (error: any) {
+    console.error("Get draft entries error:", error);
+    res.status(500).json({ error: "Internal server error", details: error.message });
+  }
+};
+
+// Finalize draft entries - change status from 'draft' to 'submitted' and assign entry_id
+export const finalizeDraftEntries: RequestHandler = async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const { warehouse, floorName, enteredByEmail } = req.body;
+    const emailFilter = enteredByEmail || req.user.email;
+
+    if (!warehouse || !floorName) {
+      return res.status(400).json({ error: "warehouse and floorName are required" });
+    }
+
+    // First, check how many drafts exist
+    const countResult: any[] = await prisma.$queryRaw(Prisma.sql`
+      SELECT COUNT(*) as cnt FROM stocktake_entries
+      WHERE status = 'draft'
+        AND UPPER(entered_by_email) = UPPER(${String(emailFilter)})
+        AND UPPER(warehouse) = UPPER(${String(warehouse)})
+        AND UPPER(floor_name) = UPPER(${String(floorName)})
+    `) as any[];
+
+    const draftCount = parseInt(countResult[0]?.cnt?.toString() || "0");
+    if (draftCount === 0) {
+      return res.status(404).json({ error: "No draft entries found to finalize" });
+    }
+
+    // Generate batch entry_id
+    let batchEntryId: string;
+    try {
+      await prisma.$executeRaw`
+        CREATE OR REPLACE FUNCTION generate_batch_entry_id()
+        RETURNS VARCHAR(8) AS $$
+        DECLARE
+            year_month VARCHAR(4);
+            next_sequence INTEGER;
+            new_entry_id VARCHAR(8);
+        BEGIN
+            year_month := TO_CHAR(CURRENT_DATE, 'YYMM');
+            SELECT COALESCE(
+                MAX(CAST(RIGHT(entry_id, 4) AS INTEGER)),
+                0
+            ) + 1
+            INTO next_sequence
+            FROM stocktake_entries
+            WHERE entry_id LIKE year_month || '%' AND entry_id IS NOT NULL;
+            new_entry_id := year_month || LPAD(next_sequence::TEXT, 4, '0');
+            RETURN new_entry_id;
+        END;
+        $$ LANGUAGE plpgsql;
+      `;
+      const entryIdResult: any[] = await prisma.$queryRaw`SELECT generate_batch_entry_id() as entry_id`;
+      batchEntryId = entryIdResult[0].entry_id;
+    } catch (error) {
+      console.error("Error generating entry_id:", error);
+      const now = new Date();
+      const year = now.getFullYear().toString().slice(-2);
+      const month = (now.getMonth() + 1).toString().padStart(2, '0');
+      const sequence = Math.floor(Math.random() * 9999) + 1;
+      batchEntryId = year + month + sequence.toString().padStart(4, '0');
+    }
+
+    // Update all matching drafts to submitted with the entry_id
+    const updated: any[] = await prisma.$queryRaw(Prisma.sql`
+      UPDATE stocktake_entries
+      SET status = 'submitted',
+          entry_id = ${batchEntryId},
+          updated_at = CURRENT_TIMESTAMP
+      WHERE status = 'draft'
+        AND UPPER(entered_by_email) = UPPER(${String(emailFilter)})
+        AND UPPER(warehouse) = UPPER(${String(warehouse)})
+        AND UPPER(floor_name) = UPPER(${String(floorName)})
+      RETURNING id
+    `) as any[];
+
+    res.json({
+      success: true,
+      message: `Successfully finalized ${updated.length} entries with entry_id: ${batchEntryId}`,
+      count: updated.length,
+      entryId: batchEntryId,
+      finalizedIds: updated.map((r: any) => r.id),
+    });
+  } catch (error: any) {
+    console.error("Finalize draft entries error:", error);
+    res.status(500).json({ error: "Internal server error", details: error.message });
+  }
+};
+
+// ============ Available Entry Dates ============
+
+export const getAvailableEntryDates: RequestHandler = async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const result: any[] = await prisma.$queryRaw`
+      SELECT DISTINCT created_at
+      FROM stocktake_entries
+      WHERE (status IS NULL OR status != 'draft')
+      ORDER BY created_at DESC
+    ` as any[];
+
+    const dateCountMap = new Map<string, number>();
+    result.forEach((row: any) => {
+      const d = new Date(row.created_at);
+      const yyyy = d.getFullYear();
+      const mm = String(d.getMonth() + 1).padStart(2, "0");
+      const dd = String(d.getDate()).padStart(2, "0");
+      const dateStr = `${yyyy}-${mm}-${dd}`;
+      dateCountMap.set(dateStr, (dateCountMap.get(dateStr) || 0) + 1);
+    });
+
+    const dates = Array.from(dateCountMap.entries()).map(([date, count]) => ({
+      date,
+      count,
+    }));
+
+    console.log("Available entry dates:", dates);
+    res.json({ success: true, dates });
+  } catch (error: any) {
+    console.error("Get available entry dates error:", error);
+    res.status(500).json({ error: "Internal server error", details: error.message });
+  }
+};
+
+// ============ Floor Review Records ============
+
+export const saveFloorReviewRecords: RequestHandler = async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const { entryIds } = req.body;
+
+    if (!entryIds || !Array.isArray(entryIds) || entryIds.length === 0) {
+      return res.status(400).json({ error: "entryIds array is required" });
+    }
+
+    const numericIds = entryIds
+      .map((id: string) => parseInt(id, 10))
+      .filter((id: number) => !isNaN(id));
+
+    if (numericIds.length === 0) {
+      return res.status(400).json({ error: "No valid entry IDs provided" });
+    }
+
+    // Use raw SQL to avoid dependency on Prisma Client generated types
+    const idList = numericIds.join(',');
+    const result: any[] = await prisma.$queryRawUnsafe(
+      `UPDATE stocktake_entries SET is_checked = true, updated_at = CURRENT_TIMESTAMP WHERE id IN (${idList}) RETURNING id`
+    );
+
+    console.log(`Floor save: marked ${result.length} entries as checked by ${(req.user as any).email || (req.user as any).name}`);
+
+    res.json({
+      success: true,
+      message: "Entries marked as checked successfully",
+      updatedCount: result.length,
+    });
+  } catch (error: any) {
+    console.error("Save floor review records error:", error);
+    res.status(500).json({ error: "Internal server error", details: error.message });
+  }
+};
+
+export const getFloorReviewRecords: RequestHandler = async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const { warehouse, floorName } = req.query;
+
+    if (!warehouse || !floorName) {
+      return res.status(400).json({ error: "warehouse and floorName query parameters are required" });
+    }
+
+    // Use raw SQL to avoid dependency on Prisma Client generated types
+    const records: any[] = await prisma.$queryRaw(Prisma.sql`
+      SELECT * FROM stocktake_entries
+      WHERE UPPER(warehouse) = UPPER(${String(warehouse)})
+        AND UPPER(floor_name) = UPPER(${String(floorName)})
+        AND is_checked = true
+        AND (status IS NULL OR status != 'draft')
+      ORDER BY item_name ASC
+    `) as any[];
+
+    const formatted = records.map((r: any) => ({
+      id: r.id,
+      entryId: r.entry_id,
+      itemName: r.item_name,
+      itemType: r.item_type,
+      itemCategory: r.item_category,
+      itemSubcategory: r.item_subcategory,
+      floorName: r.floor_name,
+      warehouse: r.warehouse,
+      totalQuantity: parseFloat(r.total_quantity?.toString() || "0"),
+      unitUom: parseFloat(r.unit_uom?.toString() || "0"),
+      totalWeight: parseFloat(r.total_weight?.toString() || "0"),
+      enteredBy: r.entered_by,
+      enteredByEmail: r.entered_by_email,
+      authority: r.authority,
+      stockType: r.stock_type,
+      isChecked: r.is_checked,
+      createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+    }));
+
+    res.json({
+      success: true,
+      records: formatted,
+      count: formatted.length,
+    });
+  } catch (error: any) {
+    console.error("Get floor review records error:", error);
+    res.status(500).json({ error: "Internal server error", details: error.message });
+  }
+};
+
+// Delete all entries belonging to a specific session batch
+// DELETE /api/stocktake-entries/delete-session?warehouse=X&floorName=Y&enteredBy=Z[&sessionId=ENTRY_ID]
+export const deleteStocktakeEntriesBySession: RequestHandler = async (req, res) => {
+  try {
+    if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+
+    const { warehouse, floorName, enteredBy, sessionId } = req.query as Record<string, string>;
+
+    if (!warehouse || !floorName || !enteredBy) {
+      return res.status(400).json({ error: "warehouse, floorName, and enteredBy are required" });
+    }
+
+    let result: any;
+    if (sessionId) {
+      result = await prisma.$queryRawUnsafe(
+        `DELETE FROM stocktake_entries
+         WHERE warehouse = $1 AND floor_name = $2 AND entered_by = $3 AND entry_id = $4`,
+        warehouse, floorName, enteredBy, sessionId
+      );
+    } else {
+      result = await prisma.$queryRawUnsafe(
+        `DELETE FROM stocktake_entries
+         WHERE warehouse = $1 AND floor_name = $2 AND entered_by = $3`,
+        warehouse, floorName, enteredBy
+      );
+    }
+
+    // $queryRawUnsafe DELETE returns the count as a bigint
+    const deleted = typeof result === "bigint" ? Number(result) : (result as any)?.count ?? 0;
+
+    res.json({ success: true, deleted });
+  } catch (error: any) {
+    console.error("Delete session entries error:", error);
+    res.status(500).json({ error: "Internal server error", details: error.message });
   }
 };

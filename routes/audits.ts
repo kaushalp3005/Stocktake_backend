@@ -12,7 +12,7 @@ export const startAudit: RequestHandler<
   try {
     if (!req.user) return res.status(401).json({ error: "Unauthorized" });
 
-    if (req.user.role !== "INVENTORY_MANAGER" && req.user.role !== "ADMIN") {
+    if (req.user.role !== "INVENTORY_MANAGER" && req.user.role !== "SUPERUSER" && req.user.role !== "ADMIN") {
       return res
         .status(403)
         .json({ error: "Only managers can start audits" });
@@ -285,7 +285,7 @@ export const approveFloorSession: RequestHandler<{ sessionId: string }> = async 
   try {
     if (!req.user) return res.status(401).json({ error: "Unauthorized" });
 
-    if (req.user.role !== "INVENTORY_MANAGER" && req.user.role !== "ADMIN") {
+    if (req.user.role !== "INVENTORY_MANAGER" && req.user.role !== "SUPERUSER" && req.user.role !== "ADMIN") {
       return res
         .status(403)
         .json({ error: "Only managers can approve sessions" });

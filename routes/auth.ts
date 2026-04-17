@@ -5,13 +5,16 @@ import { PrismaClient, Prisma } from "@prisma/client";
 const prisma = new PrismaClient();
 
 // Map database roles to application roles
-function mapRoleToAppRole(dbRole: string): "ADMIN" | "INVENTORY_MANAGER" | "FLOOR_MANAGER" {
+function mapRoleToAppRole(dbRole: string): "ADMIN" | "SUPERUSER" | "INVENTORY_MANAGER" | "FLOOR_MANAGER" {
   const roleUpper = dbRole.toUpperCase();
   if (roleUpper === "FLOORHEAD" || roleUpper === "FLOOR_HEAD") {
     return "FLOOR_MANAGER";
   }
   if (roleUpper === "MANAGER" || roleUpper === "INVENTORY_MANAGER") {
     return "INVENTORY_MANAGER";
+  }
+  if (roleUpper === "SUPERUSER" || roleUpper === "SUPER_USER") {
+    return "SUPERUSER";
   }
   if (roleUpper === "ADMIN") {
     return "ADMIN";

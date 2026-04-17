@@ -4,7 +4,7 @@ export interface User {
   id: string;
   email: string;
   name: string;
-  role: "FLOOR_MANAGER" | "INVENTORY_MANAGER" | "ADMIN";
+  role: "FLOOR_MANAGER" | "INVENTORY_MANAGER" | "SUPERUSER" | "ADMIN";
 }
 
 export interface Floor {
