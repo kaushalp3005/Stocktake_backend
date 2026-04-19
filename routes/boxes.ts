@@ -23,6 +23,66 @@ export const lookupBox: RequestHandler = async (req, res) => {
   }
 
   try {
+    // ── BE-prefix routing: bulk entry tables only ────────────────────
+    // When transaction_no starts with "BE", look up exclusively in
+    // cfpl_bulk_entry_boxes → cdpl_bulk_entry_boxes. No fallback to v2.
+    // Bulk entry rows don't carry category/subcategory/material_type;
+    // the frontend reverse-fills those from article_description.
+    if (rawTxnNo.toUpperCase().startsWith("BE")) {
+      const buildBulkQuery = (table: string) => `
+        SELECT
+          box_id,
+          transaction_no,
+          article_description,
+          net_weight
+        FROM "${table}"
+        WHERE box_id = $1
+          AND transaction_no = $2
+        LIMIT 1
+      `;
+
+      const bulkParams = [rawBoxId, rawTxnNo];
+
+      let bulkRows = await prisma.$queryRawUnsafe<any[]>(
+        buildBulkQuery("cfpl_bulk_entry_boxes"),
+        ...bulkParams
+      );
+      let bulkSource = "CFPL";
+
+      if (!bulkRows || bulkRows.length === 0) {
+        bulkRows = await prisma.$queryRawUnsafe<any[]>(
+          buildBulkQuery("cdpl_bulk_entry_boxes"),
+          ...bulkParams
+        );
+        bulkSource = "CDPL";
+      }
+
+      if (!bulkRows || bulkRows.length === 0) {
+        res.status(404).json({
+          error: `Box "${rawBoxId}" / TXN "${rawTxnNo}" not found in bulk entry records.`,
+        });
+        return;
+      }
+
+      const bulkRow = bulkRows[0];
+      const bulkItemName =
+        (bulkRow.article_description || "").toString().toUpperCase().trim() ||
+        `UNKNOWN (${rawBoxId})`;
+      const bulkUnitUom = parseFloat(bulkRow.net_weight) || 0;
+
+      res.json({
+        boxId:       bulkRow.box_id,
+        txnNo:       bulkRow.transaction_no,
+        itemName:    bulkItemName,
+        itemType:    "",
+        category:    "",
+        subcategory: "",
+        unitUom:     bulkUnitUom,
+        source:      bulkSource,
+      });
+      return;
+    }
+
     // ── Build the lookup SQL for one company prefix ──────────────────
     // We try CDPL first, then CFPL.
     // The boxes table has article_description (may be empty).

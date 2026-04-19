@@ -75,7 +75,13 @@ import {
 } from "./routes/items.js";
 import { getUserFloors, getAllFloors } from "./routes/floors.js";
 import { generateExport, getExports, exportStocktakeEntries } from "./routes/exports.js";
-import { getManagerUsers } from "./routes/users.js";
+import {
+  getManagerUsers,
+  listAllUsers,
+  createUser,
+  updateUser,
+  deleteUser,
+} from "./routes/users.js";
 import { upload, uploadSkuFile, getSkuUploadStatus } from "./routes/sku.js";
 import { lookupBox } from "./routes/boxes.js";
 
@@ -331,6 +337,12 @@ export function createServer() {
 
   // ============ Users Routes ============
   app.get("/api/users/managers", authMiddleware, getManagerUsers);
+
+  // Manage Users CRUD — FLOOR_MANAGER, ADMIN, SUPERUSER
+  app.get("/api/users",        authMiddleware, requireRole("FLOOR_MANAGER", "ADMIN", "SUPERUSER"), listAllUsers);
+  app.post("/api/users",       authMiddleware, requireRole("FLOOR_MANAGER", "ADMIN", "SUPERUSER"), createUser);
+  app.put("/api/users/:id",    authMiddleware, requireRole("FLOOR_MANAGER", "ADMIN", "SUPERUSER"), updateUser);
+  app.delete("/api/users/:id", authMiddleware, requireRole("FLOOR_MANAGER", "ADMIN", "SUPERUSER"), deleteUser);
 
   // Box QR-code lookup (CDPL / CFPL boxes → article details for StockTake)
   app.get("/api/boxes/lookup", authMiddleware, lookupBox);

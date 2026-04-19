@@ -1,0 +1,312 @@
+generator client {
+  provider = "prisma-client-js"
+  binaryTargets = ["native", "rhel-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// User Model
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  password  String
+  name      String
+  role      Role     @default(FLOOR_MANAGER)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  userWarehouses UserWarehouse[]
+  auditSessions  AuditSession[]
+  floorSessions  FloorSession[]
+  auditLogs      AuditLog[]
+  exports        ExportFile[]
+
+  @@map("users")
+}
+
+enum Role {
+  FLOOR_MANAGER
+  INVENTORY_MANAGER
+  ADMIN
+}
+
+// Warehouse Model
+model Warehouse {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  location  String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  userWarehouses UserWarehouse[]
+  floors         Floor[]
+  auditSessions  AuditSession[]
+  auditLogs      AuditLog[]
+
+  @@map("warehouses")
+}
+
+// User-Warehouse Assignment
+model UserWarehouse {
+  id          String   @id @default(cuid())
+  userId      String
+  warehouseId String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, warehouseId])
+  @@map("user_warehouses")
+}
+
+// Floor Model (now tied to Warehouse)
+model Floor {
+  id          String   @id @default(cuid())
+  warehouseId String
+  name        String // e.g., "Floor 1", "Floor 2"
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  warehouse     Warehouse      @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+  floorSessions FloorSession[]
+  auditLogs     AuditLog[]
+
+  @@unique([warehouseId, name])
+  @@map("floors")
+}
+
+// Audit Session (per warehouse per date/time)
+model AuditSession {
+  id          String      @id @default(cuid())
+  warehouseId String
+  userId      String // Auditor/Authority
+  auditDate   DateTime    @db.Date
+  auditTime   DateTime?
+  status      AuditStatus @default(DRAFT)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  // Relations
+  warehouse     Warehouse      @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  floorSessions FloorSession[]
+  auditLogs     AuditLog[]
+  ExportFile    ExportFile[]
+
+  @@unique([warehouseId, auditDate])
+  @@map("audit_sessions")
+}
+
+enum AuditStatus {
+  DRAFT
+  IN_PROGRESS
+  SUBMITTED
+  APPROVED
+}
+
+// Item Category
+model ItemCategory {
+  id   String @id @default(cuid())
+  name String @unique
+
+  // Relations
+  subCategories ItemSubCategory[]
+  items         Item[]
+
+  @@map("item_categories")
+}
+
+// Item Sub-Category
+model ItemSubCategory {
+  id         String @id @default(cuid())
+  categoryId String
+  name       String
+
+  // Relations
+  category ItemCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  items    Item[]
+
+  @@unique([categoryId, name])
+  @@map("item_sub_categories")
+}
+
+// Item Master
+model Item {
+  id            String   @id @default(cuid())
+  name          String
+  categoryId    String
+  subCategoryId String?
+  description   String?
+  kgPerUnit     Float // Package size in kg
+  unitName      String // e.g., "Bag", "Box", "Carton"
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // Relations
+  category    ItemCategory     @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  subCategory ItemSubCategory? @relation(fields: [subCategoryId], references: [id], onDelete: SetNull)
+  stockLines  StockLine[]
+
+  @@map("items")
+}
+
+// Floor Session (per floor per audit)
+model FloorSession {
+  id          String      @id @default(cuid())
+  auditId     String
+  floorId     String
+  userId      String
+  status      FloorStatus @default(DRAFT)
+  isVerified  Boolean     @default(false)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+  submittedAt DateTime?
+  approvedAt  DateTime?
+  verifiedAt  DateTime?
+
+  // Relations
+  audit   AuditSession @relation(fields: [auditId], references: [id], onDelete: Cascade)
+  floor   Floor        @relation(fields: [floorId], references: [id], onDelete: Cascade)
+  user    User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  pallets Pallet[]
+  exports ExportFile[]
+
+  @@unique([auditId, floorId])
+  @@map("floor_sessions")
+}
+
+enum FloorStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+}
+
+// Pallet (Internal grouping, temporary, no persistent ID in exports)
+model Pallet {
+  id             String   @id @default(cuid())
+  floorSessionId String
+  palletNumber   Int // Auto-numbered within session
+  locationNote   String? // e.g., "Near Lift", "Corner A"
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  // Relations
+  floorSession FloorSession @relation(fields: [floorSessionId], references: [id], onDelete: Cascade)
+  stockLines   StockLine[]
+
+  @@unique([floorSessionId, palletNumber])
+  @@map("pallets")
+}
+
+// Stock Line Item (items within pallets)
+model StockLine {
+  id           String   @id @default(cuid())
+  palletId     String
+  itemId       String
+  units        Int // Number of units
+  calculatedKg Float // Calculated: units × kgPerUnit
+  measuredKg   Float? // Measured weight (optional override)
+  remark       String? // Remark when measured KG differs
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // Relations
+  pallet Pallet @relation(fields: [palletId], references: [id], onDelete: Cascade)
+  item   Item   @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@map("stock_lines")
+}
+
+// Audit Log
+model AuditLog {
+  id          String   @id @default(cuid())
+  action      String // create, update, delete, submit, approve, verify, export
+  entityType  String // User, Warehouse, Floor, Item, FloorSession, Pallet, StockLine, AuditSession
+  entityId    String
+  userId      String
+  warehouseId String?
+  auditId     String?
+  beforeData  Json? // JSON snapshot before change
+  afterData   Json? // JSON snapshot after change
+  timestamp   DateTime @default(now())
+
+  // Relations
+  user      User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  warehouse Warehouse?    @relation(fields: [warehouseId], references: [id], onDelete: SetNull)
+  audit     AuditSession? @relation(fields: [auditId], references: [id], onDelete: SetNull)
+  Floor     Floor?        @relation(fields: [floorId], references: [id])
+  floorId   String?
+
+  @@map("audit_logs")
+}
+
+// Export File
+model ExportFile {
+  id             String   @id @default(cuid())
+  floorSessionId String?
+  auditId        String?
+  fileName       String
+  filePath       String?
+  generatedBy    String
+  generatedAt    DateTime @default(now())
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  // Relations
+  floorSession FloorSession? @relation(fields: [floorSessionId], references: [id], onDelete: SetNull)
+  audit        AuditSession? @relation(fields: [auditId], references: [id], onDelete: SetNull)
+  user         User          @relation(fields: [generatedBy], references: [id], onDelete: Cascade)
+
+  @@map("export_files")
+}
+
+// StockTake Entry - Stores individual item entries submitted by floor users
+model StockTakeEntry {
+  id               Int      @id @default(autoincrement())
+  entryId          String?  @map("entry_id") @db.VarChar(8) // Batch entry ID format: YYMM0001
+  itemName         String   @map("item_name") @db.VarChar(255)
+  itemType         String   @map("item_type") @db.VarChar(10) // 'PM', 'RM', 'FG'
+  itemCategory     String   @map("item_category") @db.VarChar(255) // Group
+  itemSubcategory  String   @map("item_subcategory") @db.VarChar(255) // Sub-group
+  floorName        String   @map("floor_name") @db.VarChar(255)
+  warehouse        String   @db.VarChar(255)
+  totalQuantity    Int      @map("total_quantity") // Number of units
+  unitUom          Decimal  @map("unit_uom") @db.Decimal(10, 3) // UOM (weight per unit in kg)
+  totalWeight      Decimal  @map("total_weight") @db.Decimal(10, 2) // Calculated: totalQuantity * unitUom
+  enteredBy        String   @map("entered_by") @db.VarChar(255) // Username
+  enteredByEmail   String?  @map("entered_by_email") @db.VarChar(255) // User email
+  authority        String   @db.VarChar(255)
+  stockType        String?  @map("stock_type") @default("Fresh Stock") @db.VarChar(50) // 'Fresh Stock' or 'Off Grade/Rejection'
+  status           String   @default("submitted") @db.VarChar(20) // 'draft' or 'submitted'
+  isChecked        Boolean  @default(false) @map("is_checked") // Floor review check
+  verified         Boolean? @default(false) // Verification status
+  verifiedBy       String?  @map("verified_by") @db.VarChar(255) // Username who verified
+  verifiedAt       DateTime? @map("verified_at") @db.Timestamp // When verified
+  remark           String?  @db.VarChar(255) // Verification remark (max 120 chars)
+  edits            Json?    // Array<EntryEdit> — append-only edit history
+  createdAt        DateTime @map("created_at") @default(now()) @db.Timestamp
+  updatedAt        DateTime @map("updated_at") @updatedAt @db.Timestamp
+
+  @@index([itemName])
+  @@index([warehouse])
+  @@index([floorName])
+  @@index([enteredBy])
+  @@index([createdAt])
+  @@index([itemType])
+  @@index([stockType])
+  @@index([warehouse, floorName])
+  @@index([entryId])
+  @@index([status])
+  @@index([enteredByEmail, status])
+  @@index([verified])
+  @@map("stocktake_entries")
+}

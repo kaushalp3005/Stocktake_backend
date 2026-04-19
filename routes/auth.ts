@@ -1,8 +1,12 @@
 import { RequestHandler } from "express";
 import { generateToken } from "../utils/auth.js";
 import { PrismaClient, Prisma } from "@prisma/client";
+import bcrypt from "bcryptjs";
+import { isBcryptHash } from "./users.js";
 
 const prisma = new PrismaClient();
+
+const BCRYPT_ROUNDS = 10;
 
 // Map database roles to application roles
 function mapRoleToAppRole(dbRole: string): "ADMIN" | "SUPERUSER" | "INVENTORY_MANAGER" | "FLOOR_MANAGER" {
@@ -108,16 +112,36 @@ export const login: RequestHandler<{}, any, LoginRequest> = async (
       return res.status(403).json({ error: "Account is disabled" });
     }
 
-    // Check password (plain text comparison for now - should be hashed in production)
-    console.log("Comparing passwords:", {
-      providedPassword: password,
-      dbPassword: dbUser.password,
-      match: dbUser.password === password
-    });
-    
-    if (dbUser.password !== password) {
+    // Check password — supports both bcrypt-hashed and legacy plaintext.
+    // If stored value looks like a bcrypt hash, use bcrypt.compare.
+    // Otherwise fall back to plaintext compare and, on success, upgrade
+    // the stored password to a bcrypt hash so future logins use the secure path.
+    let passwordOk = false;
+    let needsUpgrade = false;
+
+    if (isBcryptHash(dbUser.password)) {
+      passwordOk = await bcrypt.compare(String(password), dbUser.password);
+    } else {
+      passwordOk = dbUser.password === password;
+      needsUpgrade = passwordOk;
+    }
+
+    if (!passwordOk) {
       console.log("Password mismatch for user:", username);
       return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    if (needsUpgrade) {
+      try {
+        const newHash = await bcrypt.hash(String(password), BCRYPT_ROUNDS);
+        await prisma.$queryRaw(Prisma.sql`
+          UPDATE stocktake_users SET password = ${newHash}, updated_at = NOW() WHERE id = ${dbUser.id}
+        `);
+        console.log("Auto-upgraded plaintext password to bcrypt for user:", username);
+      } catch (upgradeErr: any) {
+        // Don't fail the login if the upgrade write fails — just log.
+        console.error("Password upgrade failed for user:", username, upgradeErr?.message);
+      }
     }
 
     // Map database role to application role
@@ -181,10 +205,13 @@ export const register: RequestHandler<{}, any, RegisterRequest> = async (
       return res.status(400).json({ error: "Email or username already in use" });
     }
 
+    // Hash password before storing
+    const hashedPassword = await bcrypt.hash(String(password), BCRYPT_ROUNDS);
+
     // Create new user in database
     const insertQuery = Prisma.sql`
       INSERT INTO stocktake_users (username, email, password, name, role, is_active, created_at)
-      VALUES (${email}, ${email}, ${password}, ${name}, ${role}, true, NOW())
+      VALUES (${email}, ${email}, ${hashedPassword}, ${name}, ${role}, true, NOW())
       RETURNING id, username, email, name, role
     `;
     
